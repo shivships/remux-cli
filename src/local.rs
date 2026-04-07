@@ -344,7 +344,7 @@ fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&st
 
     let _ = write!(
         stdout,
-        "\x1b7\x1b[{};1H\x1b[48;2;180;189;104m\x1b[38;2;29;31;33m",
+        "\x1b7\x1b[{};1H\x1b[48;2;180;189;104m\x1b[38;2;29;31;33m\x1b[2K",
         rows
     );
     if left_visible + right.len() <= w {
