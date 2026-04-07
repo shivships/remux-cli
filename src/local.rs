@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
@@ -56,8 +57,8 @@ pub struct RawModeGuard;
 impl RawModeGuard {
     pub fn enter() -> anyhow::Result<Self> {
         let mut stdout = std::io::stdout();
-        // Alternate screen + clear + enable SGR mouse reporting
-        stdout.write_all(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[?1000h\x1b[?1006h")?;
+        // Alternate screen + clear + enable SGR mouse reporting with drag tracking
+        stdout.write_all(b"\x1b[?1049h\x1b[H\x1b[2J\x1b[?1002h\x1b[?1006h")?;
         stdout.flush()?;
         crossterm::terminal::enable_raw_mode()?;
         Ok(Self)
@@ -69,7 +70,7 @@ impl Drop for RawModeGuard {
         let _ = crossterm::terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
         // Disable mouse reporting + leave alternate screen + show cursor
-        let _ = stdout.write_all(b"\x1b[?1000l\x1b[?1006l\x1b[?1049l\x1b[?25h");
+        let _ = stdout.write_all(b"\x1b[?1002l\x1b[?1006l\x1b[?1049l\x1b[?25h");
         let _ = stdout.flush();
         std::thread::sleep(Duration::from_millis(50));
         unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
@@ -79,10 +80,13 @@ impl Drop for RawModeGuard {
 // --- Mouse event parsing (SGR format) ---
 
 enum StdinEvent {
-    Data(Vec<u8>),     // regular input → forward to PTY
-    ScrollUp(i32),     // scroll up N lines
-    ScrollDown(i32),   // scroll down N lines
-    Mouse(Vec<u8>),    // mouse event → forward to PTY (when inner program wants mouse)
+    Data(Vec<u8>),           // regular input → forward to PTY
+    ScrollUp(i32),           // scroll up N lines
+    ScrollDown(i32),         // scroll down N lines
+    Mouse(Vec<u8>),          // mouse event → forward to PTY (when inner program wants mouse)
+    SelectStart(u16, u16),   // left click at (col, row) — 0-indexed
+    SelectUpdate(u16, u16),  // drag to (col, row)
+    SelectEnd,               // mouse release — copy selection
     Quit,
 }
 
@@ -115,15 +119,24 @@ fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool) -> Vec<StdinEvent> {
                     let params = &bytes[seq_start..i - 1];
                     if let Ok(params_str) = std::str::from_utf8(params) {
                         let parts: Vec<&str> = params_str.split(';').collect();
-                        if let Some(Ok(button)) = parts.first().map(|p| p.parse::<u32>()) {
+                        if parts.len() >= 3 {
+                            let button = parts[0].parse::<u32>().unwrap_or(999);
+                            let col = parts[1].parse::<u16>().unwrap_or(1).saturating_sub(1); // 1-indexed → 0-indexed
+                            let row = parts[2].parse::<u16>().unwrap_or(1).saturating_sub(1);
+                            let is_release = bytes[i - 1] == b'm';
+
+                            if inner_wants_mouse {
+                                events.push(StdinEvent::Mouse(bytes[start..i].to_vec()));
+                                continue;
+                            }
+
                             match button {
                                 64 => { events.push(StdinEvent::ScrollUp(3)); continue; }
                                 65 => { events.push(StdinEvent::ScrollDown(3)); continue; }
-                                _ if inner_wants_mouse => {
-                                    events.push(StdinEvent::Mouse(bytes[start..i].to_vec()));
-                                    continue;
-                                }
-                                _ => { continue; } // drop non-scroll mouse
+                                0 if is_release => { events.push(StdinEvent::SelectEnd); continue; }
+                                0 => { events.push(StdinEvent::SelectStart(col, row)); continue; }
+                                32 => { events.push(StdinEvent::SelectUpdate(col, row)); continue; }
+                                _ => { continue; }
                             }
                         }
                     }
@@ -249,13 +262,18 @@ fn render_line(buf: &mut Vec<u8>, term: &Term<Proxy>, line: usize, left: usize, 
 
     let grid = term.grid();
     let offset = grid.display_offset() as i32;
-    let row = &grid[Line(line as i32 - offset)];
+    let grid_line = Line(line as i32 - offset);
+    let row = &grid[grid_line];
+
+    // Get selection range for highlighting
+    let sel_range = term.selection.as_ref().and_then(|s| s.to_range(term));
 
     // Reset at start, track state within line
     buf.extend_from_slice(b"\x1b[0m");
     let mut cur_fg = Color::Named(NamedColor::Foreground);
     let mut cur_bg = Color::Named(NamedColor::Background);
     let mut cur_flags = Flags::empty();
+    let mut cur_selected = false;
 
     for col in left..=right {
         let cell = &row[Column(col)];
@@ -266,10 +284,16 @@ fn render_line(buf: &mut Vec<u8>, term: &Term<Proxy>, line: usize, left: usize, 
             continue;
         }
 
+        let point = Point::new(grid_line, Column(col));
+        let selected = sel_range.as_ref().is_some_and(|r| r.contains(point));
+
         // Only emit SGR when attributes change
         let vis_flags = cell.flags & !(Flags::WRAPLINE | Flags::WIDE_CHAR);
-        if cell.fg != cur_fg || cell.bg != cur_bg || vis_flags != cur_flags {
+        if cell.fg != cur_fg || cell.bg != cur_bg || vis_flags != cur_flags || selected != cur_selected {
             buf.extend_from_slice(b"\x1b[0m");
+            if selected {
+                buf.extend_from_slice(b"\x1b[7m"); // inverse for selection
+            }
             if vis_flags != Flags::empty() {
                 write_flags(buf, vis_flags);
             }
@@ -282,6 +306,7 @@ fn render_line(buf: &mut Vec<u8>, term: &Term<Proxy>, line: usize, left: usize, 
             cur_fg = cell.fg;
             cur_bg = cell.bg;
             cur_flags = vis_flags;
+            cur_selected = selected;
         }
 
         let mut char_buf = [0u8; 4];
@@ -360,6 +385,24 @@ fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&st
         }
     }
     let _ = write!(stdout, "\x1b[0m\x1b8");
+}
+
+// --- Base64 for OSC 52 clipboard ---
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((triple >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(triple & 0x3F) as usize] as char } else { '=' });
+    }
+    out
 }
 
 // --- Mode sync: forward terminal mode changes to the outer terminal ---
@@ -625,6 +668,61 @@ pub async fn run_local(
                     StdinEvent::Mouse(data) => {
                         // Inner program wants mouse — forward raw sequence to PTY
                         session.write_input(&data).await;
+                    }
+                    StdinEvent::SelectStart(col, row) => {
+                        let offset = term.grid().display_offset() as i32;
+                        let point = Point::new(Line(row as i32 - offset), Column(col as usize));
+                        let selection = Selection::new(SelectionType::Simple, point, Side::Left);
+                        term.selection = Some(selection);
+
+                        let mut buf = Vec::new();
+                        render_full(&mut buf, &term);
+                        position_cursor(&mut buf, &term);
+                        term.reset_damage();
+                        stdout.write_all(&buf)?;
+                        let cols = size.cols.load(Ordering::Relaxed);
+                        let rows = size.rows.load(Ordering::Relaxed);
+                        let count = session.client_count().await;
+                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                        stdout.flush()?;
+                    }
+                    StdinEvent::SelectUpdate(col, row) => {
+                        if term.selection.is_some() {
+                            let offset = term.grid().display_offset() as i32;
+                            let point = Point::new(Line(row as i32 - offset), Column(col as usize));
+                            if let Some(ref mut sel) = term.selection {
+                                sel.update(point, Side::Right);
+                            }
+
+                            let mut buf = Vec::new();
+                            render_full(&mut buf, &term);
+                            position_cursor(&mut buf, &term);
+                            term.reset_damage();
+                            stdout.write_all(&buf)?;
+                            stdout.flush()?;
+                        }
+                    }
+                    StdinEvent::SelectEnd => {
+                        if let Some(text) = term.selection_to_string() {
+                            if !text.is_empty() {
+                                // Copy to clipboard via OSC 52
+                                let encoded = base64_encode(text.as_bytes());
+                                let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+                                stdout.flush()?;
+                            }
+                        }
+                        term.selection = None;
+
+                        let mut buf = Vec::new();
+                        render_full(&mut buf, &term);
+                        position_cursor(&mut buf, &term);
+                        term.reset_damage();
+                        stdout.write_all(&buf)?;
+                        let cols = size.cols.load(Ordering::Relaxed);
+                        let rows = size.rows.load(Ordering::Relaxed);
+                        let count = session.client_count().await;
+                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                        stdout.flush()?;
                     }
                 }
             }
