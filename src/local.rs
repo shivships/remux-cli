@@ -623,14 +623,22 @@ pub async fn run_local(
                 match event {
                     StdinEvent::Quit => break,
                     StdinEvent::Data(data) => {
-                        // Snap to bottom when user types
+                        // Clear selection and snap to bottom when user types
+                        let needs_redraw = term.selection.is_some() || term.grid().display_offset() != 0;
+                        term.selection = None;
                         if term.grid().display_offset() != 0 {
                             term.scroll_display(Scroll::Bottom);
+                        }
+                        if needs_redraw {
                             let mut buf = Vec::new();
                             render_full(&mut buf, &term);
                             position_cursor(&mut buf, &term);
                             term.reset_damage();
                             stdout.write_all(&buf)?;
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let count = session.client_count().await;
+                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
                             stdout.flush()?;
                         }
                         session.write_input(&data).await;
@@ -670,6 +678,47 @@ pub async fn run_local(
                         session.write_input(&data).await;
                     }
                     StdinEvent::SelectStart(col, row) => {
+                        let cols = size.cols.load(Ordering::Relaxed);
+                        let rows = size.rows.load(Ordering::Relaxed);
+                        let pty_rows = rows.saturating_sub(1).max(1);
+
+                        // Click on status bar?
+                        if row >= pty_rows {
+                            let right_text = "Ctrl+Q: quit ";
+                            let right_start = (cols as usize).saturating_sub(right_text.len());
+
+                            if col as usize >= right_start {
+                                // Clicked quit
+                                break;
+                            } else if let Some(ref s) = slug {
+                                // Clicked URL area — copy URL
+                                let url = format!("https://remux.sh/{}", s);
+                                let encoded = base64_encode(url.as_bytes());
+                                let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+
+                                // Flash "Copied!" over just the URL
+                                let display = bar_url.as_deref().unwrap_or("");
+                                let copied = "Copied!";
+                                let pad = display.len().saturating_sub(copied.len());
+                                let _ = write!(
+                                    stdout,
+                                    "\x1b7\x1b[{};2H\x1b[48;2;180;189;104m\x1b[1;38;2;29;31;33m{}{}\x1b[0m\x1b8",
+                                    rows, copied, " ".repeat(pad)
+                                );
+                                stdout.flush()?;
+
+                                tokio::time::sleep(Duration::from_millis(800)).await;
+
+                                // Redraw normal bar
+                                let count = session.client_count().await;
+                                draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                                stdout.flush()?;
+                            }
+                            continue;
+                        }
+
+                        // Clear existing selection, start new one
+                        term.selection = None;
                         let offset = term.grid().display_offset() as i32;
                         let point = Point::new(Line(row as i32 - offset), Column(col as usize));
                         let selection = Selection::new(SelectionType::Simple, point, Side::Left);
@@ -680,8 +729,6 @@ pub async fn run_local(
                         position_cursor(&mut buf, &term);
                         term.reset_damage();
                         stdout.write_all(&buf)?;
-                        let cols = size.cols.load(Ordering::Relaxed);
-                        let rows = size.rows.load(Ordering::Relaxed);
                         let count = session.client_count().await;
                         draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
                         stdout.flush()?;
@@ -703,26 +750,15 @@ pub async fn run_local(
                         }
                     }
                     StdinEvent::SelectEnd => {
+                        // Auto-copy on release, keep selection visible
                         if let Some(text) = term.selection_to_string() {
                             if !text.is_empty() {
-                                // Copy to clipboard via OSC 52
                                 let encoded = base64_encode(text.as_bytes());
                                 let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
                                 stdout.flush()?;
                             }
                         }
-                        term.selection = None;
-
-                        let mut buf = Vec::new();
-                        render_full(&mut buf, &term);
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
-                        let cols = size.cols.load(Ordering::Relaxed);
-                        let rows = size.rows.load(Ordering::Relaxed);
-                        let count = session.client_count().await;
-                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                        stdout.flush()?;
+                        // Selection stays visible until next click or keystroke
                     }
                 }
             }
