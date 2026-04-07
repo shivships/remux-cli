@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write as IoWrite};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler
 use alacritty_terminal::Term;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::modal::ModalContent;
 use crate::shared_session::SharedSession;
 
 // --- Event proxy: forwards PtyWrite responses back to the PTY ---
@@ -80,27 +81,56 @@ impl Drop for RawModeGuard {
 // --- Mouse event parsing (SGR format) ---
 
 enum StdinEvent {
-    Data(Vec<u8>),           // regular input → forward to PTY
-    ScrollUp(i32),           // scroll up N lines
-    ScrollDown(i32),         // scroll down N lines
-    Mouse(Vec<u8>),          // mouse event → forward to PTY (when inner program wants mouse)
-    SelectStart(u16, u16),   // left click at (col, row) — 0-indexed
-    SelectUpdate(u16, u16),  // drag to (col, row)
-    SelectEnd,               // mouse release — copy selection
-    Quit,
+    Data(Vec<u8>),                          // regular input → forward to PTY
+    ScrollUp(i32),                          // scroll up N lines
+    ScrollDown(i32),                        // scroll down N lines
+    Mouse(Vec<u8>),                         // mouse event → forward to PTY (when inner program wants mouse)
+    SelectStart { col: u16, row: u16, alt: bool },  // left click
+    SelectUpdate(u16, u16),                 // drag to (col, row)
+    SelectEnd,                              // mouse release — copy selection
+    ModalToggle,                            // Ctrl+Q
+    ModalCopy,                              // 'c' while modal open
+    ModalQuit,                              // 'q' while modal open
+    ModalDismiss,                           // esc while modal open
 }
 
 /// Parse stdin bytes, extracting scroll events from SGR mouse sequences.
 /// SGR mouse format: \x1b[<button;col;row[Mm]
 /// Button 64 = scroll up, 65 = scroll down.
-fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool) -> Vec<StdinEvent> {
+fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool, modal_open: bool) -> Vec<StdinEvent> {
     let mut events = Vec::new();
     let mut i = 0;
 
     while i < bytes.len() {
+        // Ctrl+Q always toggles modal
         if bytes[i] == 0x11 {
-            events.push(StdinEvent::Quit);
-            return events;
+            events.push(StdinEvent::ModalToggle);
+            i += 1;
+            continue;
+        }
+
+        // When modal is open, intercept keys
+        if modal_open {
+            match bytes[i] {
+                b'c' | b'C' => { events.push(StdinEvent::ModalCopy); i += 1; continue; }
+                b'q' | b'Q' => { events.push(StdinEvent::ModalQuit); i += 1; continue; }
+                0x1b => {
+                    // Bare Esc (not followed by [) dismisses modal
+                    if i + 1 >= bytes.len() || bytes[i + 1] != b'[' {
+                        events.push(StdinEvent::ModalDismiss);
+                        i += 1;
+                        continue;
+                    }
+                    // Escape sequence (mouse events, etc.) — skip silently
+                    i += 2;
+                    while i < bytes.len() && !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'~') {
+                        i += 1;
+                    }
+                    if i < bytes.len() { i += 1; }
+                    continue;
+                }
+                _ => { i += 1; continue; } // ignore other keys while modal open
+            }
         }
 
         // Check for escape sequences
@@ -130,11 +160,15 @@ fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool) -> Vec<StdinEvent> {
                                 continue;
                             }
 
-                            match button {
+                            // Button encoding: bits 2-3 = modifiers (4=shift, 8=alt, 16=ctrl)
+                            let has_alt = button & 8 != 0;
+                            let base_button = button & !0b11100; // strip modifiers
+
+                            match base_button {
                                 64 => { events.push(StdinEvent::ScrollUp(3)); continue; }
                                 65 => { events.push(StdinEvent::ScrollDown(3)); continue; }
                                 0 if is_release => { events.push(StdinEvent::SelectEnd); continue; }
-                                0 => { events.push(StdinEvent::SelectStart(col, row)); continue; }
+                                0 => { events.push(StdinEvent::SelectStart { col, row, alt: has_alt }); continue; }
                                 32 => { events.push(StdinEvent::SelectUpdate(col, row)); continue; }
                                 _ => { continue; }
                             }
@@ -362,8 +396,8 @@ fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&st
         format!(" {} connected", clients).len()
     };
 
-    let right = "Ctrl+Q: quit ";
-    let right_seq = format!("\x1b[38;2;100;100;100m{}\x1b[38;2;29;31;33m", right);
+    let right = "Ctrl+Q: menu ";
+    let right_seq = format!("{}", right);
 
     let gap = w.saturating_sub(left_visible + right.len());
 
@@ -526,10 +560,15 @@ pub async fn run_local(
     draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
     stdout.flush()?;
 
+    // Modal state
+    let modal_open = Arc::new(AtomicBool::new(false));
+    let modal_content = slug.as_deref().map(|s| Arc::new(ModalContent::new(s)));
+
     // Stdin → parse mouse events + forward data
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinEvent>();
     let stdin_mode = Arc::new(std::sync::atomic::AtomicU32::new(last_mode.bits()));
     let stdin_mode_clone = Arc::clone(&stdin_mode);
+    let stdin_modal = Arc::clone(&modal_open);
     let mut stdin_task = tokio::task::spawn_blocking(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 1024];
@@ -542,12 +581,9 @@ pub async fn run_local(
                     let mode_bits = stdin_mode_clone.load(Ordering::Relaxed);
                     let mode = TermMode::from_bits_truncate(mode_bits);
                     let inner_wants_mouse = mode.intersects(TermMode::MOUSE_MODE);
-                    let events = parse_stdin(bytes, inner_wants_mouse);
+                    let is_modal = stdin_modal.load(Ordering::SeqCst);
+                    let events = parse_stdin(bytes, inner_wants_mouse, is_modal);
                     for event in events {
-                        if matches!(event, StdinEvent::Quit) {
-                            let _ = stdin_tx.send(StdinEvent::Quit);
-                            return;
-                        }
                         let _ = stdin_tx.send(event);
                     }
                 }
@@ -575,6 +611,12 @@ pub async fn run_local(
         }
     });
 
+    // Click tracking for double/triple-click
+    let mut last_click_time = std::time::Instant::now();
+    let mut last_click_pos: (u16, u16) = (0, 0);
+    let mut click_count: u8 = 0;
+    const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(300);
+
     // Output loop
     let mut broadcast_rx = broadcast_rx;
     loop {
@@ -584,28 +626,38 @@ pub async fn run_local(
                     Ok(data) => {
                         parser.advance(&mut term, &data);
 
-                        let mut buf = Vec::new();
-                        render_damage(&mut buf, &mut term);
-
                         // Sync terminal modes (mouse, bracketed paste, etc.)
                         let new_mode = *term.mode();
                         if new_mode != last_mode {
                             debug_log(&format!("MODE {} -> {}", format_mode(last_mode), format_mode(new_mode)));
-                            // Update stdin's view of the mode for mouse routing
                             stdin_mode.store(new_mode.bits(), Ordering::Relaxed);
                         }
-                        sync_modes(&mut buf, last_mode, new_mode);
-                        last_mode = new_mode;
 
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
+                        if modal_open.load(Ordering::SeqCst) {
+                            // Modal is open — don't render grid, just sync modes
+                            let mut buf = Vec::new();
+                            sync_modes(&mut buf, last_mode, new_mode);
+                            last_mode = new_mode;
+                            term.reset_damage();
+                            if !buf.is_empty() {
+                                stdout.write_all(&buf)?;
+                                stdout.flush()?;
+                            }
+                        } else {
+                            let mut buf = Vec::new();
+                            render_damage(&mut buf, &mut term);
+                            sync_modes(&mut buf, last_mode, new_mode);
+                            last_mode = new_mode;
+                            position_cursor(&mut buf, &term);
+                            term.reset_damage();
+                            stdout.write_all(&buf)?;
 
-                        let cols = size.cols.load(Ordering::Relaxed);
-                        let rows = size.rows.load(Ordering::Relaxed);
-                        let count = session.client_count().await;
-                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                        stdout.flush()?;
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let count = session.client_count().await;
+                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                            stdout.flush()?;
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let mut buf = Vec::new();
@@ -621,7 +673,6 @@ pub async fn run_local(
             // Handle stdin events (scroll, data, mouse)
             Some(event) = stdin_rx.recv() => {
                 match event {
-                    StdinEvent::Quit => break,
                     StdinEvent::Data(data) => {
                         // Clear selection and snap to bottom when user types
                         let needs_redraw = term.selection.is_some() || term.grid().display_offset() != 0;
@@ -677,19 +728,31 @@ pub async fn run_local(
                         // Inner program wants mouse — forward raw sequence to PTY
                         session.write_input(&data).await;
                     }
-                    StdinEvent::SelectStart(col, row) => {
+                    StdinEvent::SelectStart { col, row, alt } => {
                         let cols = size.cols.load(Ordering::Relaxed);
                         let rows = size.rows.load(Ordering::Relaxed);
                         let pty_rows = rows.saturating_sub(1).max(1);
 
                         // Click on status bar?
                         if row >= pty_rows {
-                            let right_text = "Ctrl+Q: quit ";
+                            let right_text = "Ctrl+Q: menu ";
                             let right_start = (cols as usize).saturating_sub(right_text.len());
 
                             if col as usize >= right_start {
-                                // Clicked quit
-                                break;
+                                // Clicked menu — open modal
+                                if let Some(ref content) = modal_content {
+                                    modal_open.store(true, Ordering::SeqCst);
+                                    let _ = stdout.write_all(b"\x1b[?25l");
+                                    for frame in 0..3u8 {
+                                        let data = content.render_frame(cols, rows, frame);
+                                        stdout.write_all(&data)?;
+                                        stdout.flush()?;
+                                        if frame < 2 {
+                                            tokio::time::sleep(Duration::from_millis(33)).await;
+                                        }
+                                    }
+                                }
+                                continue;
                             } else if let Some(ref s) = slug {
                                 // Clicked URL area — copy URL
                                 let url = format!("https://remux.sh/{}", s);
@@ -709,7 +772,6 @@ pub async fn run_local(
 
                                 tokio::time::sleep(Duration::from_millis(800)).await;
 
-                                // Redraw normal bar
                                 let count = session.client_count().await;
                                 draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
                                 stdout.flush()?;
@@ -717,12 +779,43 @@ pub async fn run_local(
                             continue;
                         }
 
+                        // Track click count for double/triple-click
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_click_time) < DOUBLE_CLICK_TIMEOUT
+                            && last_click_pos == (col, row)
+                        {
+                            click_count = (click_count % 3) + 1;
+                        } else {
+                            click_count = 1;
+                        }
+                        last_click_time = now;
+                        last_click_pos = (col, row);
+
+                        // Determine selection type
+                        let sel_type = if alt {
+                            SelectionType::Block
+                        } else {
+                            match click_count {
+                                2 => SelectionType::Semantic,
+                                3 => SelectionType::Lines,
+                                _ => SelectionType::Simple,
+                            }
+                        };
+
                         // Clear existing selection, start new one
                         term.selection = None;
                         let offset = term.grid().display_offset() as i32;
                         let point = Point::new(Line(row as i32 - offset), Column(col as usize));
-                        let selection = Selection::new(SelectionType::Simple, point, Side::Left);
+                        let selection = Selection::new(sel_type, point, Side::Left);
                         term.selection = Some(selection);
+
+                        // For double/triple click, also update the end point to trigger
+                        // word/line expansion immediately
+                        if click_count >= 2 {
+                            if let Some(ref mut sel) = term.selection {
+                                sel.update(point, Side::Right);
+                            }
+                        }
 
                         let mut buf = Vec::new();
                         render_full(&mut buf, &term);
@@ -759,6 +852,76 @@ pub async fn run_local(
                             }
                         }
                         // Selection stays visible until next click or keystroke
+                    }
+                    StdinEvent::ModalToggle => {
+                        let is_open = modal_open.load(Ordering::SeqCst);
+                        if is_open {
+                            // Close modal — redraw terminal
+                            modal_open.store(false, Ordering::SeqCst);
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let pty_rows = rows.saturating_sub(1).max(1);
+                            let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
+                            let mut buf = Vec::new();
+                            render_full(&mut buf, &term);
+                            position_cursor(&mut buf, &term);
+                            term.reset_damage();
+                            stdout.write_all(&buf)?;
+                            let _ = stdout.write_all(b"\x1b[?25h"); // show cursor
+                            let count = session.client_count().await;
+                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                            stdout.flush()?;
+                        } else if let Some(ref content) = modal_content {
+                            // Open modal with animation
+                            modal_open.store(true, Ordering::SeqCst);
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let _ = stdout.write_all(b"\x1b[?25l"); // hide cursor
+                            for frame in 0..3u8 {
+                                let data = content.render_frame(cols, rows, frame);
+                                stdout.write_all(&data)?;
+                                stdout.flush()?;
+                                if frame < 2 {
+                                    tokio::time::sleep(Duration::from_millis(33)).await;
+                                }
+                            }
+                        }
+                    }
+                    StdinEvent::ModalCopy => {
+                        if let Some(ref content) = modal_content {
+                            let encoded = base64_encode(content.url.as_bytes());
+                            let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let flash = content.render_copied_flash(cols, rows);
+                            stdout.write_all(&flash)?;
+                            stdout.flush()?;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let frame = content.render_full(cols, rows);
+                            stdout.write_all(&frame)?;
+                            stdout.flush()?;
+                        }
+                    }
+                    StdinEvent::ModalQuit => {
+                        break;
+                    }
+                    StdinEvent::ModalDismiss => {
+                        if modal_open.load(Ordering::SeqCst) {
+                            modal_open.store(false, Ordering::SeqCst);
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let pty_rows = rows.saturating_sub(1).max(1);
+                            let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
+                            let mut buf = Vec::new();
+                            render_full(&mut buf, &term);
+                            position_cursor(&mut buf, &term);
+                            term.reset_damage();
+                            stdout.write_all(&buf)?;
+                            let _ = stdout.write_all(b"\x1b[?25h");
+                            let count = session.client_count().await;
+                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                            stdout.flush()?;
+                        }
                     }
                 }
             }

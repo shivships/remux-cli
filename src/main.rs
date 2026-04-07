@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 mod local;
+mod modal;
 mod protocol;
 mod server;
 mod session;
