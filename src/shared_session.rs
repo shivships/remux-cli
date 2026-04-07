@@ -108,6 +108,10 @@ impl SharedSession {
         })
     }
 
+    pub async fn client_count(&self) -> usize {
+        self.state.lock().await.clients.len()
+    }
+
     pub async fn spawn(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         if state.pty.is_none() {
