@@ -27,12 +27,20 @@ use render::{base64_encode, draw_bar, position_cursor, render_damage, render_ful
 #[derive(Clone)]
 pub(crate) struct Proxy {
     pty_tx: mpsc::UnboundedSender<String>,
+    pending_title: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl EventListener for Proxy {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event {
-            let _ = self.pty_tx.send(text);
+        match event {
+            Event::PtyWrite(text) => { let _ = self.pty_tx.send(text); }
+            Event::Title(title) => {
+                *self.pending_title.lock().unwrap() = Some(format!("\x1b]2;{}\x07", title));
+            }
+            Event::ResetTitle => {
+                *self.pending_title.lock().unwrap() = Some("\x1b]2;\x07".to_string());
+            }
+            _ => {}
         }
     }
 }
@@ -127,6 +135,10 @@ fn sync_cursor_style(buf: &mut Vec<u8>, old: CursorStyle, new: CursorStyle) {
 // --- Debug logging ---
 
 fn debug_log(msg: &str) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let enabled = ENABLED.get_or_init(|| std::env::var("REMUX_DEBUG").is_ok());
+    if !enabled { return; }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("/tmp/remux-debug.log") {
         let _ = writeln!(f, "{}", msg);
     }
@@ -186,7 +198,8 @@ pub async fn run_local(
     });
 
     let (pty_write_tx, mut pty_write_rx) = mpsc::unbounded_channel::<String>();
-    let proxy = Proxy { pty_tx: pty_write_tx };
+    let pending_title = Arc::new(std::sync::Mutex::new(None::<String>));
+    let proxy = Proxy { pty_tx: pty_write_tx, pending_title: Arc::clone(&pending_title) };
 
     let mut term = Term::new(
         Config::default(),
@@ -286,6 +299,11 @@ pub async fn run_local(
                 match result {
                     Ok(data) => {
                         parser.advance(&mut term, &data);
+
+                        // Flush any pending title change to Ghostty
+                        if let Some(title_seq) = pending_title.lock().unwrap().take() {
+                            stdout.write_all(title_seq.as_bytes())?;
+                        }
 
                         let new_mode = *term.mode();
                         if new_mode != last_mode {
