@@ -12,7 +12,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, TermMode};
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Processor, StdSyncHandler};
 use alacritty_terminal::Term;
 use tokio::sync::{broadcast, mpsc};
 
@@ -105,6 +105,25 @@ fn sync_mode(buf: &mut Vec<u8>, old: TermMode, new: TermMode, flag: TermMode, co
     }
 }
 
+// --- Cursor shape sync ---
+
+fn sync_cursor_style(buf: &mut Vec<u8>, old: CursorStyle, new: CursorStyle) {
+    if old == new {
+        return;
+    }
+    use std::io::Write;
+    let code = match (new.shape, new.blinking) {
+        (CursorShape::Block, true) => 1,
+        (CursorShape::Block, false) => 2,
+        (CursorShape::Underline, true) => 3,
+        (CursorShape::Underline, false) => 4,
+        (CursorShape::Beam, true) => 5,
+        (CursorShape::Beam, false) => 6,
+        _ => 0, // default
+    };
+    let _ = write!(buf, "\x1b[{} q", code);
+}
+
 // --- Debug logging ---
 
 fn debug_log(msg: &str) {
@@ -176,6 +195,7 @@ pub async fn run_local(
     );
     let mut parser = Processor::<StdSyncHandler>::new();
     let mut last_mode = *term.mode();
+    let mut last_cursor_style = term.cursor_style();
     debug_log(&format!("INIT mode: {}", format_mode(last_mode)));
 
     let mut stdout = std::io::stdout();
@@ -190,6 +210,9 @@ pub async fn run_local(
     let new_mode = *term.mode();
     sync_modes(&mut buf, last_mode, new_mode);
     last_mode = new_mode;
+    let new_cursor = term.cursor_style();
+    sync_cursor_style(&mut buf, last_cursor_style, new_cursor);
+    last_cursor_style = new_cursor;
     term.reset_damage();
     position_cursor(&mut buf, &term);
     stdout.write_all(&buf)?;
@@ -270,10 +293,14 @@ pub async fn run_local(
                             stdin_mode.store(new_mode.bits(), Ordering::Relaxed);
                         }
 
+                        let new_cursor = term.cursor_style();
+
                         if modal_open.load(Ordering::SeqCst) {
                             let mut buf = Vec::new();
                             sync_modes(&mut buf, last_mode, new_mode);
                             last_mode = new_mode;
+                            sync_cursor_style(&mut buf, last_cursor_style, new_cursor);
+                            last_cursor_style = new_cursor;
                             term.reset_damage();
                             if !buf.is_empty() {
                                 stdout.write_all(&buf)?;
@@ -284,6 +311,8 @@ pub async fn run_local(
                             render_damage(&mut buf, &mut term);
                             sync_modes(&mut buf, last_mode, new_mode);
                             last_mode = new_mode;
+                            sync_cursor_style(&mut buf, last_cursor_style, new_cursor);
+                            last_cursor_style = new_cursor;
                             position_cursor(&mut buf, &term);
                             term.reset_damage();
                             stdout.write_all(&buf)?;
