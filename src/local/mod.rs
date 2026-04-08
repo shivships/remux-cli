@@ -27,7 +27,7 @@ use render::{base64_encode, draw_bar, position_cursor, render_damage, render_ful
 #[derive(Clone)]
 pub(crate) struct Proxy {
     pty_tx: mpsc::UnboundedSender<String>,
-    pending_title: Arc<std::sync::Mutex<Option<String>>>,
+    pending_stdout: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl EventListener for Proxy {
@@ -35,14 +35,49 @@ impl EventListener for Proxy {
         match event {
             Event::PtyWrite(text) => { let _ = self.pty_tx.send(text); }
             Event::Title(title) => {
-                *self.pending_title.lock().unwrap() = Some(format!("\x1b]2;{}\x07", title));
+                self.pending_stdout.lock().unwrap().push(format!("\x1b]2;{}\x07", title));
             }
             Event::ResetTitle => {
-                *self.pending_title.lock().unwrap() = Some("\x1b]2;\x07".to_string());
+                self.pending_stdout.lock().unwrap().push("\x1b]2;\x07".to_string());
+            }
+            Event::ClipboardStore(ty, data) => {
+                let param = match ty {
+                    alacritty_terminal::term::ClipboardType::Clipboard => "c",
+                    alacritty_terminal::term::ClipboardType::Selection => "p",
+                };
+                let encoded = render::base64_encode(data.as_bytes());
+                self.pending_stdout.lock().unwrap().push(format!("\x1b]52;{};{}\x07", param, encoded));
             }
             _ => {}
         }
     }
+}
+
+/// Scan raw PTY output for OSC 7 sequences and return them for forwarding.
+fn extract_osc7(data: &[u8]) -> Option<Vec<u8>> {
+    // Look for \x1b]7;...\x07
+    let mut i = 0;
+    let mut results = Vec::new();
+    while i < data.len() {
+        if data[i] == 0x1b && i + 2 < data.len() && data[i + 1] == b']' && data[i + 2] == b'7' {
+            let start = i;
+            i += 3;
+            while i < data.len() && data[i] != 0x07 {
+                if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            if i < data.len() && data[i] == 0x07 {
+                i += 1;
+            }
+            results.extend_from_slice(&data[start..i]);
+        } else {
+            i += 1;
+        }
+    }
+    if results.is_empty() { None } else { Some(results) }
 }
 
 // --- Terminal size for alacritty_terminal ---
@@ -198,8 +233,8 @@ pub async fn run_local(
     });
 
     let (pty_write_tx, mut pty_write_rx) = mpsc::unbounded_channel::<String>();
-    let pending_title = Arc::new(std::sync::Mutex::new(None::<String>));
-    let proxy = Proxy { pty_tx: pty_write_tx, pending_title: Arc::clone(&pending_title) };
+    let pending_stdout = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let proxy = Proxy { pty_tx: pty_write_tx, pending_stdout: Arc::clone(&pending_stdout) };
 
     let mut term = Term::new(
         Config::default(),
@@ -298,11 +333,19 @@ pub async fn run_local(
             result = broadcast_rx.recv() => {
                 match result {
                     Ok(data) => {
+                        // Forward OSC 7 (cwd) to Ghostty before parser consumes it
+                        if let Some(osc7) = extract_osc7(&data) {
+                            stdout.write_all(&osc7)?;
+                        }
+
                         parser.advance(&mut term, &data);
 
-                        // Flush any pending title change to Ghostty
-                        if let Some(title_seq) = pending_title.lock().unwrap().take() {
-                            stdout.write_all(title_seq.as_bytes())?;
+                        // Flush pending events (title, clipboard) to Ghostty
+                        {
+                            let mut pending = pending_stdout.lock().unwrap();
+                            for seq in pending.drain(..) {
+                                stdout.write_all(seq.as_bytes())?;
+                            }
                         }
 
                         let new_mode = *term.mode();
