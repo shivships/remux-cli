@@ -24,8 +24,13 @@ async fn main() -> anyhow::Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "zsh".into());
     let workspace_root = std::env::current_dir()?;
     let (cols, rows) = crossterm::terminal::size()?;
+    // Reserve the bottom row for the status bar.
+    let pty_rows = rows.saturating_sub(1).max(1);
 
-    let session = shared_session::SharedSession::new(shell, workspace_root);
+    // Note: this spawns the PTY (and therefore the shell's rc files) before
+    // the tunnel is started below. Any rc-file output lands in the replay
+    // buffer and is delivered to the first client on attach.
+    let session = shared_session::SharedSession::new(shell, workspace_root, cols, pty_rows)?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
@@ -53,10 +58,6 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("tunnel unavailable: {}", e);
         }
     }
-
-    // Spawn PTY at actual terminal size (minus status bar row)
-    let pty_rows = rows.saturating_sub(1).max(1);
-    session.spawn(cols, pty_rows).await?;
 
     // Restore terminal on panic
     let default_hook = std::panic::take_hook();

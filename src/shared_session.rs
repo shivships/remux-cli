@@ -10,23 +10,31 @@ use tracing::{debug, info, warn};
 const REPLAY_BUFFER_SIZE: usize = 64 * 1024;
 
 pub struct SharedSession {
-    state: tokio::sync::Mutex<SessionState>,
+    state: std::sync::Mutex<SessionState>,
     replay: Arc<std::sync::Mutex<ReplayBuffer>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     pty_exited: watch::Sender<bool>,
-    input_tx: std::sync::OnceLock<mpsc::Sender<Vec<u8>>>,
-    shell: String,
-    workspace_root: PathBuf,
+    input_tx: mpsc::Sender<Vec<u8>>,
 }
 
 struct SessionState {
-    pty: Option<PtyState>,
+    pty: PtyState,
     clients: HashMap<u64, ClientInfo>,
     next_client_id: u64,
 }
 
 struct PtyState {
+    // Declared BEFORE _child so master drops first: master drop → SIGHUP →
+    // child exits → reader sees EOF. The _child handle drop is a no-op on
+    // Unix (std::process::Child::drop doesn't reap), so ordering only matters
+    // for the SIGHUP path.
     master: Box<dyn portable_pty::MasterPty + Send>,
+    // Retained to keep the child handle alive for the session's lifetime and
+    // preserve the option of explicit kill/wait in future graceful-shutdown
+    // or re-spawn paths. Currently unused at runtime — termination flows
+    // through the PTY SIGHUP path above.
+    #[allow(dead_code)]
+    _child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
 struct ClientInfo {
@@ -92,35 +100,85 @@ impl ReplayBuffer {
 }
 
 impl SharedSession {
-    pub fn new(shell: String, workspace_root: PathBuf) -> Arc<Self> {
+    pub fn new(
+        shell: String,
+        workspace_root: PathBuf,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<Arc<Self>> {
         let (broadcast_tx, _) = broadcast::channel(256);
-        Arc::new(Self {
-            state: tokio::sync::Mutex::new(SessionState {
-                pty: None,
+        let replay = Arc::new(std::sync::Mutex::new(ReplayBuffer::new()));
+        let pty_exited = watch::Sender::new(false);
+
+        // Capacity is in *events*, not bytes — one write_input call is one
+        // user action (a key, a paste frame). 64 queued events is generous;
+        // overflow parks the caller (cooperative backpressure) instead of
+        // blocking the shared session state mutex.
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        // Fallible PTY construction first. Any `?` below returns before the
+        // blocking tasks are spawned, so an init failure can't leak a thread.
+        let pty_system = native_pty_system();
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty_pair = pty_system.openpty(size)?;
+
+        let mut cmd = CommandBuilder::new(&shell);
+        if shell.ends_with("zsh") {
+            cmd.args(["-o", "nopromptsp"]);
+        }
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("REMUX_SESSION", "1");
+        cmd.cwd(&workspace_root);
+
+        let child = pty_pair.slave.spawn_command(cmd)?;
+        drop(pty_pair.slave);
+
+        let writer = pty_pair.master.take_writer()?;
+        let reader = pty_pair.master.try_clone_reader()?;
+
+        info!(cols, rows, "Terminal spawned");
+
+        // Reader side.
+        let replay_reader = Arc::clone(&replay);
+        let broadcast_tx_reader = broadcast_tx.clone();
+        let pty_exited_reader = pty_exited.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::read_loop(reader, replay_reader, broadcast_tx_reader);
+            let _ = pty_exited_reader.send(true);
+        });
+
+        // Writer side: dedicated task on the blocking thread pool.
+        let pty_exited_writer = pty_exited.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::write_loop(writer, input_rx);
+            // Writer-side EOF (broken pipe, shell gone) also trips exit so
+            // the session tears down even if the reader hasn't seen EOF yet.
+            let _ = pty_exited_writer.send(true);
+        });
+
+        Ok(Arc::new(Self {
+            state: std::sync::Mutex::new(SessionState {
+                pty: PtyState {
+                    master: pty_pair.master,
+                    _child: child,
+                },
                 clients: HashMap::new(),
                 next_client_id: 0,
             }),
-            replay: Arc::new(std::sync::Mutex::new(ReplayBuffer::new())),
+            replay,
             broadcast_tx,
-            pty_exited: watch::Sender::new(false),
-            input_tx: std::sync::OnceLock::new(),
-            shell,
-            workspace_root,
-        })
+            pty_exited,
+            input_tx,
+        }))
     }
 
     pub async fn client_count(&self) -> usize {
-        self.state.lock().await.clients.len()
-    }
-
-    pub async fn spawn(&self, cols: u16, rows: u16) -> anyhow::Result<()> {
-        let mut state = self.state.lock().await;
-        if state.pty.is_none() {
-            let pty = self.spawn_pty(cols, rows)?;
-            info!(cols, rows, "Terminal spawned");
-            state.pty = Some(pty);
-        }
-        Ok(())
+        self.state.lock().unwrap().clients.len()
     }
 
     pub async fn wait_for_exit(&self) {
@@ -138,7 +196,7 @@ impl SharedSession {
         rows: u16,
     ) -> anyhow::Result<(u64, Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         let client_id = {
-            let mut state = self.state.lock().await;
+            let mut state = self.state.lock().unwrap();
             let id = state.next_client_id;
             state.next_client_id += 1;
             state.clients.insert(id, ClientInfo { cols, rows });
@@ -158,14 +216,14 @@ impl SharedSession {
     }
 
     pub async fn detach(&self, client_id: u64) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock().unwrap();
         state.clients.remove(&client_id);
         recalc_size(&state);
         info!(client_id, clients = state.clients.len(), "Client detached");
     }
 
     pub async fn resize(&self, client_id: u64, cols: u16, rows: u16) {
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock().unwrap();
         if let Some(client) = state.clients.get_mut(&client_id) {
             client.cols = cols;
             client.rows = rows;
@@ -174,75 +232,9 @@ impl SharedSession {
     }
 
     pub async fn write_input(&self, data: Vec<u8>) {
-        let Some(tx) = self.input_tx.get() else {
-            return; // PTY not spawned yet
-        };
-        if let Err(e) = tx.send(data).await {
+        if let Err(e) = self.input_tx.send(data).await {
             warn!("Failed to queue PTY input: {}", e);
         }
-    }
-
-    fn spawn_pty(&self, cols: u16, rows: u16) -> anyhow::Result<PtyState> {
-        let pty_system = native_pty_system();
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        let pty_pair = pty_system.openpty(size)?;
-
-        let mut cmd = CommandBuilder::new(&self.shell);
-        if self.shell.ends_with("zsh") {
-            cmd.args(["-o", "nopromptsp"]);
-        }
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("REMUX_SESSION", "1");
-        cmd.cwd(&self.workspace_root);
-
-        let _child = pty_pair.slave.spawn_command(cmd)?;
-        drop(pty_pair.slave);
-
-        let writer = pty_pair.master.take_writer()?;
-        let reader = pty_pair.master.try_clone_reader()?;
-
-        // Reader side.
-        let replay = Arc::clone(&self.replay);
-        let broadcast_tx = self.broadcast_tx.clone();
-        let pty_exited_reader = self.pty_exited.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::read_loop(reader, replay, broadcast_tx);
-            let _ = pty_exited_reader.send(true);
-        });
-
-        // Writer side: dedicated task on the blocking thread pool.
-        // Capacity is in *events*, not bytes — one write_input call is one
-        // user action (a key, a paste frame). 64 queued events is generous;
-        // overflow parks the caller (cooperative backpressure) instead of
-        // blocking the shared session state mutex.
-        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
-
-        // spawn() is guarded by `if state.pty.is_none()`, so this path runs
-        // exactly once per SharedSession lifetime. A hard panic (rather than
-        // debug_assert) ensures any future refactor that introduces a
-        // re-spawn path fails loudly in release instead of silently leaving
-        // a stale write_loop pointing at a replaced PTY master. The check
-        // costs one atomic compare per session startup.
-        self.input_tx
-            .set(input_tx)
-            .expect("spawn_pty called more than once");
-
-        let pty_exited_writer = self.pty_exited.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::write_loop(writer, input_rx);
-            // Writer-side EOF (broken pipe, shell gone) also trips exit so
-            // the session tears down even if the reader hasn't seen EOF yet.
-            let _ = pty_exited_writer.send(true);
-        });
-
-        Ok(PtyState {
-            master: pty_pair.master,
-        })
     }
 
     fn read_loop(
@@ -288,18 +280,16 @@ fn recalc_size(state: &SessionState) {
     if state.clients.is_empty() {
         return;
     }
-    if let Some(ref pty) = state.pty {
-        let min_cols = state.clients.values().map(|c| c.cols).min().unwrap();
-        let min_rows = state.clients.values().map(|c| c.rows).min().unwrap();
-        let size = PtySize {
-            rows: min_rows,
-            cols: min_cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        if let Err(e) = pty.master.resize(size) {
-            warn!("Failed to resize PTY: {}", e);
-        }
-        debug!(cols = min_cols, rows = min_rows, "PTY resized");
+    let min_cols = state.clients.values().map(|c| c.cols).min().unwrap();
+    let min_rows = state.clients.values().map(|c| c.rows).min().unwrap();
+    let size = PtySize {
+        rows: min_rows,
+        cols: min_cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    if let Err(e) = state.pty.master.resize(size) {
+        warn!("Failed to resize PTY: {}", e);
     }
+    debug!(cols = min_cols, rows = min_rows, "PTY resized");
 }
