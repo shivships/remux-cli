@@ -1,12 +1,11 @@
 use std::fmt::Write as FmtWrite;
 
-const GREEN: &str = "\x1b[38;2;180;189;104m";
-const BOLD_GREEN: &str = "\x1b[1;38;2;180;189;104m";
-const DIM_GRAY: &str = "\x1b[38;2;128;128;128m";
-const BRIGHT_WHITE: &str = "\x1b[97m";
-const MODAL_BG: &str = "\x1b[48;2;45;47;51m";
+const MODAL_BG: &str = "\x1b[48;2;38;38;38m";          // #262626
+const PRIMARY: &str = "\x1b[38;2;250;250;250m";        // #FAFAFA
+const BOLD_PRIMARY: &str = "\x1b[1;38;2;250;250;250m"; // #FAFAFA bold — URL + "Copied!"
+const SECONDARY: &str = "\x1b[38;2;163;163;163m";      // #A3A3A3 — title
+const MUTED: &str = "\x1b[38;2;115;115;115m";          // #737373 — hint verbs
 const RESET: &str = "\x1b[0m";
-const COPIED_GREEN: &str = "\x1b[1;38;2;180;189;104m";
 
 pub struct ModalContent {
     pub url: String,
@@ -103,7 +102,7 @@ impl ModalContent {
             "\x1b7\x1b[{};{}H{}{}{}{}{}{}{}\x1b8",
             row, start_col,
             MODAL_BG, " ".repeat(pad_left),
-            COPIED_GREEN, copied_text, RESET,
+            BOLD_PRIMARY, copied_text, RESET,
             MODAL_BG, " ".repeat(pad_right),
         );
         out.into_bytes()
@@ -125,45 +124,44 @@ impl ModalContent {
 
         let mut lines: Vec<String> = Vec::new();
 
-        let blank = || format!("{}{}{:w$}", MODAL_BG, GREEN, "");
-        let centered = |text: &str, color: &str, len: usize| -> String {
-            let pad_left = (w.saturating_sub(len)) / 2;
-            let pad_right = w.saturating_sub(pad_left + len);
+        let blank = || format!("{MODAL_BG}{}", " ".repeat(w));
+        let centered_fixed = |content_styled: &str, visible_len: usize| -> String {
+            let pad_left = (w.saturating_sub(visible_len)) / 2;
+            let pad_right = w.saturating_sub(pad_left + visible_len);
             format!(
-                "{}{}{}{}{}{}",
-                MODAL_BG, " ".repeat(pad_left), color, text, RESET, MODAL_BG,
-            ) + &" ".repeat(pad_right)
+                "{MODAL_BG}{}{content_styled}{RESET}{MODAL_BG}{}",
+                " ".repeat(pad_left),
+                " ".repeat(pad_right),
+            )
         };
 
         lines.push(blank());
-        lines.push(centered(title, DIM_GRAY, title.len()));
+        lines.push(centered_fixed(&format!("{SECONDARY}{title}"), title.len()));
         lines.push(blank());
 
         if !self.qr_lines.is_empty() {
             for qr_line in &self.qr_lines {
                 let qr_char_width = qr_line.chars().count();
-                let pad_left = (w.saturating_sub(qr_char_width)) / 2;
-                let pad_right = w.saturating_sub(pad_left + qr_char_width);
-                lines.push(format!(
-                    "{}{}{}{}{}",
-                    MODAL_BG, " ".repeat(pad_left), BRIGHT_WHITE, qr_line, RESET,
-                ) + &format!("{}{}", MODAL_BG, " ".repeat(pad_right)));
+                lines.push(centered_fixed(&format!("{PRIMARY}{qr_line}"), qr_char_width));
             }
             lines.push(blank());
         }
 
         {
-            let pad_left = (w.saturating_sub(url_width)) / 2;
-            let pad_right = w.saturating_sub(pad_left + url_width);
-            lines.push(format!(
-                "{}{}{}\x1b]8;;{}\x07{}\x1b]8;;\x07{}{}",
-                MODAL_BG, " ".repeat(pad_left), BOLD_GREEN,
-                self.url, self.display_url, RESET, MODAL_BG,
-            ) + &" ".repeat(pad_right));
+            let url = &self.url;
+            let display_url = &self.display_url;
+            let url_styled = format!(
+                "{BOLD_PRIMARY}\x1b]8;;{url}\x07{display_url}\x1b]8;;\x07"
+            );
+            lines.push(centered_fixed(&url_styled, url_width));
         }
 
         lines.push(blank());
-        lines.push(centered(hints, DIM_GRAY, hints.len()));
+        // Hint line: keys bright, verbs muted
+        let hint_styled = format!(
+            "{PRIMARY}[c]{MUTED} copy    {PRIMARY}[q]{MUTED} quit    {PRIMARY}[esc]{MUTED} close"
+        );
+        lines.push(centered_fixed(&hint_styled, hints.len()));
         lines.push(blank());
 
         lines
@@ -183,18 +181,18 @@ impl ModalContent {
             &self.display_url
         };
         let pad = w.saturating_sub(display.len());
+        let url = &self.url;
         lines.push(format!(
-            "{}{}\x1b]8;;{}\x07{}\x1b]8;;\x07{}{}{}",
-            MODAL_BG, BOLD_GREEN, self.url, display, RESET, MODAL_BG, " ".repeat(pad),
+            "{MODAL_BG}{BOLD_PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07{RESET}{MODAL_BG}{}",
+            " ".repeat(pad),
         ));
 
         let hints = "[c] copy [q] quit [esc] close";
         let hints_display = if hints.len() > w { &hints[..w] } else { hints };
         let hpad = w.saturating_sub(hints_display.len());
         lines.push(format!(
-            "{}{}{}{}{}",
-            MODAL_BG, DIM_GRAY, hints_display, RESET,
-            format!("{}{}", MODAL_BG, " ".repeat(hpad)),
+            "{MODAL_BG}{MUTED}{hints_display}{RESET}{MODAL_BG}{}",
+            " ".repeat(hpad),
         ));
 
         lines

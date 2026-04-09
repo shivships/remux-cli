@@ -153,40 +153,50 @@ pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
 pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&str>, slug: Option<&str>, clients: usize) {
     let w = cols as usize;
 
-    let left = if let (Some(display), Some(s)) = (bar_url, slug) {
+    // Bar palette
+    const BG: &str = "\x1b[48;2;38;38;38m";           // #262626
+    const PRIMARY: &str = "\x1b[38;2;250;250;250m";   // #FAFAFA
+    const SECONDARY: &str = "\x1b[38;2;163;163;163m"; // #A3A3A3
+    const MUTED: &str = "\x1b[38;2;82;82;82m";        // #525252
+    const LIVE: &str = "\x1b[38;2;34;197;94m";        // #22C55E
+
+    let clients_str = clients.to_string();
+    let dot_color = if clients >= 1 { LIVE } else { MUTED };
+
+    let (left_styled, left_visible) = if let (Some(display), Some(s)) = (bar_url, slug) {
         let full_url = format!("https://remux.sh/{}", s);
-        format!(
-            " \x1b]8;;{}\x07{}\x1b]8;;\x07 │ {} connected",
-            full_url, display, clients
-        )
+        let styled = format!(
+            " {PRIMARY}\x1b]8;;{full_url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{clients_str} connected"
+        );
+        // Visible: " " + display + " │ ● " + count + " connected"
+        let visible = 16 + display.chars().count() + clients_str.len();
+        (styled, visible)
     } else {
-        format!(" {} connected", clients)
+        let styled = format!(
+            " {dot_color}● {SECONDARY}{clients_str} connected"
+        );
+        let visible = 13 + clients_str.len();
+        (styled, visible)
     };
 
-    let left_visible = if let Some(display) = bar_url {
-        format!(" {} │ {} connected", display, clients).len()
-    } else {
-        format!(" {} connected", clients).len()
-    };
+    let right_text_visible = "Ctrl+Q: share ".len();
+    let right_styled = format!("{PRIMARY}Ctrl+Q{MUTED}: {SECONDARY}share ");
 
-    let right = "Ctrl+Q: menu ";
-    let right_seq = format!("{}", right);
-
-    let gap = w.saturating_sub(left_visible + right.len());
+    let gap = w.saturating_sub(left_visible + right_text_visible);
 
     let _ = write!(
         stdout,
-        "\x1b7\x1b[{};1H\x1b[48;2;180;189;104m\x1b[38;2;29;31;33m\x1b[2K",
+        "\x1b7\x1b[{};1H{BG}{PRIMARY}\x1b[2K",
         rows
     );
-    if left_visible + right.len() <= w {
-        let _ = write!(stdout, "{}{:gap$}{}", left, "", right_seq);
-        let total = left_visible + gap + right.len();
+    if left_visible + right_text_visible <= w {
+        let _ = write!(stdout, "{}{:gap$}{}", left_styled, "", right_styled);
+        let total = left_visible + gap + right_text_visible;
         if total < w {
             let _ = write!(stdout, "{}", " ".repeat(w - total));
         }
     } else {
-        let _ = write!(stdout, "{}", left);
+        let _ = write!(stdout, "{}", left_styled);
         if left_visible < w {
             let _ = write!(stdout, "{}", " ".repeat(w - left_visible));
         }

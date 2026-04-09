@@ -463,7 +463,7 @@ pub async fn run_local(
                         let pty_rows = rows.saturating_sub(1).max(1);
 
                         if row >= pty_rows {
-                            let right_text = "Ctrl+Q: menu ";
+                            let right_text = "Ctrl+Q: share ";
                             let right_start = (cols as usize).saturating_sub(right_text.len());
 
                             if col as usize >= right_start {
@@ -490,7 +490,7 @@ pub async fn run_local(
                                 let pad = display.len().saturating_sub(copied.len());
                                 let _ = write!(
                                     stdout,
-                                    "\x1b7\x1b[{};2H\x1b[48;2;180;189;104m\x1b[1;38;2;29;31;33m{}{}\x1b[0m\x1b8",
+                                    "\x1b7\x1b[{};2H\x1b[48;2;38;38;38m\x1b[1;38;2;250;250;250m{}{}\x1b[0m\x1b8",
                                     rows, copied, " ".repeat(pad)
                                 );
                                 stdout.flush()?;
