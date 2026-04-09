@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
 
     // Start tunnel, extract slug for status bar
-    let mut _tunnel_child = None;
+    let mut tunnel_child = None;
     let mut bar_url: Option<String> = None;
     let mut slug: Option<String> = None;
 
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
             bar_url = Some(format!("remux.sh/{}", s));
             slug = Some(s);
             tunnel::spawn_keepalive(url);
-            _tunnel_child = Some(child);
+            tunnel_child = Some(child);
         }
         Err(e) => {
             eprintln!("tunnel unavailable: {}", e);
@@ -76,5 +76,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     drop(_raw_guard);
+    // Kill the tunnel subprocess before exiting. start_kill() is synchronous
+    // and sends SIGKILL immediately; no need to await.
+    if let Some(ref mut child) = tunnel_child {
+        child.start_kill().ok();
+    }
+    // Background tokio tasks (SIGWINCH handler, keepalive, etc.) have no
+    // cancellation mechanism and would prevent clean runtime shutdown.
     std::process::exit(0);
 }

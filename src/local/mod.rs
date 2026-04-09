@@ -217,6 +217,40 @@ struct AtomicSize {
     rows: AtomicU16,
 }
 
+fn flush_term(stdout: &mut impl IoWrite, term: &mut Term<Proxy>) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    render_full(&mut buf, term);
+    position_cursor(&mut buf, term);
+    term.reset_damage();
+    stdout.write_all(&buf)
+}
+
+async fn flush_bar(
+    stdout: &mut impl IoWrite,
+    size: &AtomicSize,
+    session: &SharedSession,
+    bar_url: Option<&str>,
+    slug: Option<&str>,
+) -> std::io::Result<()> {
+    let cols = size.cols.load(Ordering::Relaxed);
+    let rows = size.rows.load(Ordering::Relaxed);
+    let count = session.client_count().await;
+    draw_bar(stdout, cols, rows, bar_url, slug, count);
+    stdout.flush()
+}
+
+async fn flush_term_with_bar(
+    stdout: &mut impl IoWrite,
+    term: &mut Term<Proxy>,
+    size: &AtomicSize,
+    session: &SharedSession,
+    bar_url: Option<&str>,
+    slug: Option<&str>,
+) -> std::io::Result<()> {
+    flush_term(stdout, term)?;
+    flush_bar(stdout, size, session, bar_url, slug).await
+}
+
 pub async fn run_local(
     session: Arc<SharedSession>,
     bar_url: Option<String>,
@@ -386,11 +420,7 @@ pub async fn run_local(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let mut buf = Vec::new();
-                        render_full(&mut buf, &term);
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
+                        flush_term(&mut stdout, &mut term)?;
                         stdout.flush()?;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -405,16 +435,7 @@ pub async fn run_local(
                             term.scroll_display(Scroll::Bottom);
                         }
                         if needs_redraw {
-                            let mut buf = Vec::new();
-                            render_full(&mut buf, &term);
-                            position_cursor(&mut buf, &term);
-                            term.reset_damage();
-                            stdout.write_all(&buf)?;
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                            stdout.flush()?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
                         session.write_input(&data).await;
                     }
@@ -422,31 +443,13 @@ pub async fn run_local(
                         debug_log(&format!("SCROLL UP {} (offset before: {})", n, term.grid().display_offset()));
                         term.scroll_display(Scroll::Delta(n));
                         debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                        let mut buf = Vec::new();
-                        render_full(&mut buf, &term);
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
-                        let cols = size.cols.load(Ordering::Relaxed);
-                        let rows = size.rows.load(Ordering::Relaxed);
-                        let count = session.client_count().await;
-                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                        stdout.flush()?;
+                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                     }
                     StdinEvent::ScrollDown(n) => {
                         debug_log(&format!("SCROLL DOWN {} (offset before: {})", n, term.grid().display_offset()));
                         term.scroll_display(Scroll::Delta(-n));
                         debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                        let mut buf = Vec::new();
-                        render_full(&mut buf, &term);
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
-                        let cols = size.cols.load(Ordering::Relaxed);
-                        let rows = size.rows.load(Ordering::Relaxed);
-                        let count = session.client_count().await;
-                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                        stdout.flush()?;
+                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                     }
                     StdinEvent::Mouse(data) => {
                         session.write_input(&data).await;
@@ -489,9 +492,7 @@ pub async fn run_local(
                                 );
                                 stdout.flush()?;
                                 tokio::time::sleep(Duration::from_millis(800)).await;
-                                let count = session.client_count().await;
-                                draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                                stdout.flush()?;
+                                flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                             }
                             continue;
                         }
@@ -530,14 +531,7 @@ pub async fn run_local(
                             }
                         }
 
-                        let mut buf = Vec::new();
-                        render_full(&mut buf, &term);
-                        position_cursor(&mut buf, &term);
-                        term.reset_damage();
-                        stdout.write_all(&buf)?;
-                        let count = session.client_count().await;
-                        draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                        stdout.flush()?;
+                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                     }
                     StdinEvent::SelectUpdate(col, row) => {
                         if term.selection.is_some() {
@@ -547,16 +541,7 @@ pub async fn run_local(
                                 sel.update(point, Side::Right);
                             }
 
-                            let mut buf = Vec::new();
-                            render_full(&mut buf, &term);
-                            position_cursor(&mut buf, &term);
-                            term.reset_damage();
-                            stdout.write_all(&buf)?;
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                            stdout.flush()?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
                     }
                     StdinEvent::SelectEnd => {
@@ -571,15 +556,7 @@ pub async fn run_local(
                         // Single click drag: clear selection
                         if click_count <= 1 {
                             term.selection = None;
-                            let mut buf = Vec::new();
-                            render_full(&mut buf, &term);
-                            position_cursor(&mut buf, &term);
-                            term.reset_damage();
-                            stdout.write_all(&buf)?;
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
                         stdout.flush()?;
                     }
@@ -587,19 +564,11 @@ pub async fn run_local(
                         let is_open = modal_open.load(Ordering::SeqCst);
                         if is_open {
                             modal_open.store(false, Ordering::SeqCst);
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let pty_rows = rows.saturating_sub(1).max(1);
+                            let pty_rows = size.rows.load(Ordering::Relaxed).saturating_sub(1).max(1);
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
-                            let mut buf = Vec::new();
-                            render_full(&mut buf, &term);
-                            position_cursor(&mut buf, &term);
-                            term.reset_damage();
-                            stdout.write_all(&buf)?;
+                            flush_term(&mut stdout, &mut term)?;
                             let _ = stdout.write_all(b"\x1b[?25h");
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                            stdout.flush()?;
+                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         } else if let Some(ref content) = modal_content {
                             modal_open.store(true, Ordering::SeqCst);
                             let cols = size.cols.load(Ordering::Relaxed);
@@ -636,19 +605,11 @@ pub async fn run_local(
                     StdinEvent::ModalDismiss => {
                         if modal_open.load(Ordering::SeqCst) {
                             modal_open.store(false, Ordering::SeqCst);
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let pty_rows = rows.saturating_sub(1).max(1);
+                            let pty_rows = size.rows.load(Ordering::Relaxed).saturating_sub(1).max(1);
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
-                            let mut buf = Vec::new();
-                            render_full(&mut buf, &term);
-                            position_cursor(&mut buf, &term);
-                            term.reset_damage();
-                            stdout.write_all(&buf)?;
+                            flush_term(&mut stdout, &mut term)?;
                             let _ = stdout.write_all(b"\x1b[?25h");
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                            stdout.flush()?;
+                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
                     }
                 }
@@ -660,16 +621,7 @@ pub async fn run_local(
                 let pty_rows = rows.saturating_sub(1).max(1);
                 term.resize(TermSize::new(pty_rows, cols));
                 let _ = write!(stdout, "\x1b[1;{}r", pty_rows);
-
-                let mut buf = Vec::new();
-                render_full(&mut buf, &term);
-                position_cursor(&mut buf, &term);
-                term.reset_damage();
-                stdout.write_all(&buf)?;
-
-                let count = session.client_count().await;
-                draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                stdout.flush()?;
+                flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
             }
             _ = &mut stdin_task => break,
         }
