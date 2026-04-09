@@ -437,7 +437,7 @@ pub async fn run_local(
                         if needs_redraw {
                             flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
-                        session.write_input(&data).await;
+                        session.write_input(data).await;
                     }
                     StdinEvent::ScrollUp(n) => {
                         debug_log(&format!("SCROLL UP {} (offset before: {})", n, term.grid().display_offset()));
@@ -452,7 +452,7 @@ pub async fn run_local(
                         flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                     }
                     StdinEvent::Mouse(data) => {
-                        session.write_input(&data).await;
+                        session.write_input(data).await;
                     }
                     StdinEvent::SelectStart { col, row, alt } => {
                         let cols = size.cols.load(Ordering::Relaxed);
@@ -615,7 +615,7 @@ pub async fn run_local(
                 }
             }
             Some(text) = pty_write_rx.recv() => {
-                session.write_input(text.as_bytes()).await;
+                session.write_input(text.into_bytes()).await;
             }
             Some((cols, rows)) = resize_rx.recv() => {
                 let pty_rows = rows.saturating_sub(1).max(1);

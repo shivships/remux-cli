@@ -104,7 +104,7 @@ async fn run_inner(mut stream: TcpStream, session: &SharedSession) -> anyhow::Re
                     }
                     MSG_TERMINAL_DATA => {
                         if client_id.is_some() {
-                            session.write_input(payload).await;
+                            session.write_input(payload.to_vec()).await;
                         }
                     }
                     _ => {

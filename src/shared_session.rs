@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
 
 const REPLAY_BUFFER_SIZE: usize = 64 * 1024;
@@ -14,6 +14,7 @@ pub struct SharedSession {
     replay: Arc<std::sync::Mutex<ReplayBuffer>>,
     broadcast_tx: broadcast::Sender<Vec<u8>>,
     pty_exited: watch::Sender<bool>,
+    input_tx: std::sync::OnceLock<mpsc::Sender<Vec<u8>>>,
     shell: String,
     workspace_root: PathBuf,
 }
@@ -26,7 +27,6 @@ struct SessionState {
 
 struct PtyState {
     master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
 }
 
 struct ClientInfo {
@@ -103,6 +103,7 @@ impl SharedSession {
             replay: Arc::new(std::sync::Mutex::new(ReplayBuffer::new())),
             broadcast_tx,
             pty_exited: watch::Sender::new(false),
+            input_tx: std::sync::OnceLock::new(),
             shell,
             workspace_root,
         })
@@ -172,12 +173,12 @@ impl SharedSession {
         recalc_size(&state);
     }
 
-    pub async fn write_input(&self, data: &[u8]) {
-        let mut state = self.state.lock().await;
-        if let Some(ref mut pty) = state.pty {
-            if let Err(e) = pty.writer.write_all(data) {
-                warn!("Failed to write to PTY: {}", e);
-            }
+    pub async fn write_input(&self, data: Vec<u8>) {
+        let Some(tx) = self.input_tx.get() else {
+            return; // PTY not spawned yet
+        };
+        if let Err(e) = tx.send(data).await {
+            warn!("Failed to queue PTY input: {}", e);
         }
     }
 
@@ -205,18 +206,42 @@ impl SharedSession {
         let writer = pty_pair.master.take_writer()?;
         let reader = pty_pair.master.try_clone_reader()?;
 
+        // Reader side.
         let replay = Arc::clone(&self.replay);
         let broadcast_tx = self.broadcast_tx.clone();
-        let pty_exited = self.pty_exited.clone();
-
+        let pty_exited_reader = self.pty_exited.clone();
         tokio::task::spawn_blocking(move || {
             Self::read_loop(reader, replay, broadcast_tx);
-            let _ = pty_exited.send(true);
+            let _ = pty_exited_reader.send(true);
+        });
+
+        // Writer side: dedicated task on the blocking thread pool.
+        // Capacity is in *events*, not bytes — one write_input call is one
+        // user action (a key, a paste frame). 64 queued events is generous;
+        // overflow parks the caller (cooperative backpressure) instead of
+        // blocking the shared session state mutex.
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>(64);
+
+        // spawn() is guarded by `if state.pty.is_none()`, so this path runs
+        // exactly once per SharedSession lifetime. A hard panic (rather than
+        // debug_assert) ensures any future refactor that introduces a
+        // re-spawn path fails loudly in release instead of silently leaving
+        // a stale write_loop pointing at a replaced PTY master. The check
+        // costs one atomic compare per session startup.
+        self.input_tx
+            .set(input_tx)
+            .expect("spawn_pty called more than once");
+
+        let pty_exited_writer = self.pty_exited.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::write_loop(writer, input_rx);
+            // Writer-side EOF (broken pipe, shell gone) also trips exit so
+            // the session tears down even if the reader hasn't seen EOF yet.
+            let _ = pty_exited_writer.send(true);
         });
 
         Ok(PtyState {
             master: pty_pair.master,
-            writer,
         })
     }
 
@@ -243,6 +268,19 @@ impl SharedSession {
             }
         }
         info!("PTY read loop ended");
+    }
+
+    fn write_loop(
+        mut writer: Box<dyn Write + Send>,
+        mut input_rx: mpsc::Receiver<Vec<u8>>,
+    ) {
+        while let Some(data) = input_rx.blocking_recv() {
+            if let Err(e) = writer.write_all(&data) {
+                warn!("PTY write failed, ending write loop: {}", e);
+                break;
+            }
+        }
+        debug!("PTY write loop ended");
     }
 }
 
