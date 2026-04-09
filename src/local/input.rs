@@ -5,6 +5,7 @@ pub enum StdinEvent {
     ScrollUp(i32),
     ScrollDown(i32),
     Mouse(Vec<u8>),
+    Focus(Vec<u8>),
     SelectStart { col: u16, row: u16, alt: bool },
     SelectUpdate(u16, u16),
     SelectEnd,
@@ -97,6 +98,16 @@ pub fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool, modal_open: bool) -> V
                 } else {
                     break;
                 }
+            }
+
+            // Focus in/out: \x1b[I / \x1b[O — forward without triggering scroll-to-bottom
+            if i + 2 < bytes.len()
+                && bytes[i + 1] == b'['
+                && (bytes[i + 2] == b'I' || bytes[i + 2] == b'O')
+            {
+                events.push(StdinEvent::Focus(bytes[i..i + 3].to_vec()));
+                i += 3;
+                continue;
             }
 
             // Other escape sequences — forward as data

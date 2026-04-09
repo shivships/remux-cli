@@ -454,6 +454,9 @@ pub async fn run_local(
                     StdinEvent::Mouse(data) => {
                         session.write_input(data).await;
                     }
+                    StdinEvent::Focus(data) => {
+                        session.write_input(data).await;
+                    }
                     StdinEvent::SelectStart { col, row, alt } => {
                         let cols = size.cols.load(Ordering::Relaxed);
                         let rows = size.rows.load(Ordering::Relaxed);
