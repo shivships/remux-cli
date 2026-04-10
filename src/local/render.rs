@@ -150,24 +150,23 @@ pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
     let _ = write!(buf, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
 }
 
-pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&str>, slug: Option<&str>, clients: usize, flash_copied: bool) {
+pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Option<&str>, full_url: Option<&str>, clients: usize, flash_copied: bool) {
     let w = cols as usize;
 
     // Bar palette
     const BG: &str = "\x1b[48;2;38;38;38m";             // #262626
     const PRIMARY: &str = "\x1b[38;2;250;250;250m";     // #FAFAFA
     const SECONDARY: &str = "\x1b[38;2;163;163;163m";   // #A3A3A3
-    const MUTED: &str = "\x1b[38;2;82;82;82m";          // #525252
+    const MUTED: &str = "\x1b[38;2;154;154;154m";       // #9A9A9A
     const LIVE: &str = "\x1b[38;2;34;197;94m";          // #22C55E
     const BOLD_LIVE: &str = "\x1b[1;38;2;34;197;94m";   // #22C55E bold — "Copied!" flash
 
     let clients_str = clients.to_string();
     let dot_color = if clients >= 1 { LIVE } else { MUTED };
 
-    let (left_styled, left_visible) = if let (Some(display), Some(s)) = (bar_url, slug) {
-        let full_url = format!("https://remux.sh/{}", s);
+    let (left_styled, left_visible) = if let (Some(display), Some(url)) = (display_url, full_url) {
         let styled = format!(
-            " {PRIMARY}\x1b]8;;{full_url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{clients_str} connected"
+            " {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{clients_str} connected"
         );
         // Visible: " " + display + " │ ● " + count + " connected"
         let visible = 16 + display.chars().count() + clients_str.len();

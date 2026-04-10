@@ -4,7 +4,8 @@ const MODAL_BG: &str = "\x1b[48;2;38;38;38m";          // #262626
 const PRIMARY: &str = "\x1b[38;2;250;250;250m";        // #FAFAFA
 const BOLD_PRIMARY: &str = "\x1b[1;38;2;250;250;250m"; // #FAFAFA bold — URL + "Copied!"
 const SECONDARY: &str = "\x1b[38;2;163;163;163m";      // #A3A3A3 — title
-const MUTED: &str = "\x1b[38;2;115;115;115m";          // #737373 — hint verbs
+const MUTED: &str = "\x1b[38;2;154;154;154m";          // #9A9A9A — hint verbs
+const LIVE: &str = "\x1b[38;2;34;197;94m";             // #22C55E — toggle on
 const RESET: &str = "\x1b[0m";
 
 pub struct ModalContent {
@@ -14,9 +15,9 @@ pub struct ModalContent {
 }
 
 impl ModalContent {
-    pub fn new(slug: &str) -> Self {
-        let url = format!("https://remux.sh/{}", slug);
-        let display_url = format!("remux.sh/{}", slug);
+    pub fn new(full_url: &str, display_url: &str) -> Self {
+        let url = full_url.to_string();
+        let display_url = display_url.to_string();
 
         let qr_lines = if let Ok(qr) = fast_qr::QRBuilder::new(url.as_str()).build() {
             qr.to_str().lines().map(|l| l.to_string()).collect()
@@ -27,9 +28,9 @@ impl ModalContent {
         Self { url, display_url, qr_lines }
     }
 
-    pub fn render_frame(&self, cols: u16, rows: u16, frame: u8) -> Vec<u8> {
+    pub fn render_frame(&self, cols: u16, rows: u16, frame: u8, show_on_start: bool) -> Vec<u8> {
         let pty_rows = rows.saturating_sub(1).max(1) as usize;
-        let all_lines = self.build_content_lines(cols);
+        let all_lines = self.build_content_lines(cols, show_on_start);
         let box_height = all_lines.len();
         let box_width = all_lines.iter().map(|l| visible_len(l)).max().unwrap_or(0);
 
@@ -69,18 +70,23 @@ impl ModalContent {
         out.into_bytes()
     }
 
-    fn build_content_lines(&self, cols: u16) -> Vec<String> {
+    fn build_content_lines(&self, cols: u16, show_on_start: bool) -> Vec<String> {
         let cols = cols as usize;
 
         let qr_width = self.qr_lines.first().map(|l| l.chars().count()).unwrap_or(0);
         let url_width = self.display_url.len();
         let title = "open this terminal from any browser";
         let hints = "[c] copy    [q] quit    [esc] close";
-        let content_width = qr_width.max(url_width).max(hints.len()).max(title.len());
+        let toggle = "[d] show on startup _"; // placeholder for width calc
+        let content_width = qr_width
+            .max(url_width)
+            .max(hints.len())
+            .max(toggle.len())
+            .max(title.len());
         let w = content_width + 6;
 
         if w > cols {
-            return self.build_compact_lines(cols);
+            return self.build_compact_lines(cols, show_on_start);
         }
 
         let mut lines: Vec<String> = Vec::new();
@@ -118,17 +124,24 @@ impl ModalContent {
         }
 
         lines.push(blank());
-        // Hint line: keys bright, verbs muted
         let hint_styled = format!(
             "{PRIMARY}[c]{MUTED} copy    {PRIMARY}[q]{MUTED} quit    {PRIMARY}[esc]{MUTED} close"
         );
         lines.push(centered_fixed(&hint_styled, hints.len()));
         lines.push(blank());
 
+        // Toggle line
+        let (mark, mark_color) = if show_on_start { ("\u{2713}", LIVE) } else { ("\u{2717}", MUTED) };
+        let toggle_styled = format!(
+            "{PRIMARY}[d] {MUTED}show on startup {mark_color}{mark}"
+        );
+        lines.push(centered_fixed(&toggle_styled, toggle.len()));
+        lines.push(blank());
+
         lines
     }
 
-    fn build_compact_lines(&self, cols: usize) -> Vec<String> {
+    fn build_compact_lines(&self, cols: usize, show_on_start: bool) -> Vec<String> {
         let w = cols.saturating_sub(4);
         if w < 10 {
             return Vec::new();
@@ -148,11 +161,15 @@ impl ModalContent {
             " ".repeat(pad),
         ));
 
-        let hints = "[c] copy [q] quit [esc] close";
-        let hints_display = if hints.len() > w { &hints[..w] } else { hints };
+        let (mark, mark_color) = if show_on_start { ("\u{2713}", LIVE) } else { ("\u{2717}", MUTED) };
+        let hints = format!("[c] copy [q] quit [d] startup {mark} [esc]");
+        let hints_styled = format!(
+            "{PRIMARY}[c]{MUTED} copy {PRIMARY}[q]{MUTED} quit {PRIMARY}[d]{MUTED} startup {mark_color}{mark} {PRIMARY}[esc]"
+        );
+        let hints_display = if hints.len() > w { &hints[..w] } else { &hints };
         let hpad = w.saturating_sub(hints_display.len());
         lines.push(format!(
-            "{MODAL_BG}{MUTED}{hints_display}{RESET}{MODAL_BG}{}",
+            "{MODAL_BG}{hints_styled}{RESET}{MODAL_BG}{}",
             " ".repeat(hpad),
         ));
 

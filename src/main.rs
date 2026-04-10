@@ -3,6 +3,7 @@ use std::io::Write;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+mod config;
 mod local;
 mod modal;
 mod protocol;
@@ -27,6 +28,8 @@ async fn main() -> anyhow::Result<()> {
     // Reserve the bottom row for the status bar.
     let pty_rows = rows.saturating_sub(1).max(1);
 
+    let config = config::Config::load();
+
     // Note: this spawns the PTY (and therefore the shell's rc files) before
     // the tunnel is started below. Any rc-file output lands in the replay
     // buffer and is delivered to the first client on attach.
@@ -37,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Start tunnel with spinner animation (pre-alt-screen)
     let mut tunnel_child = None;
-    let mut bar_url: Option<String> = None;
-    let mut slug: Option<String> = None;
+    let mut full_url: Option<String> = None;
+    let mut display_url: Option<String> = None;
 
     {
         const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -69,17 +72,17 @@ async fn main() -> anyhow::Result<()> {
         };
 
         match result {
-            Ok((child, url)) => {
-                let s = url
+            Ok((child, tunnel_url)) => {
+                let slug = tunnel_url
                     .trim_start_matches("https://")
                     .trim_start_matches("http://")
                     .split('.')
                     .next()
                     .unwrap_or("")
                     .to_string();
-                bar_url = Some(format!("remux.sh/{}", s));
-                slug = Some(s);
-                tunnel::spawn_keepalive(url);
+                full_url = Some(format!("{}/{}", config.base_url, slug));
+                display_url = Some(format!("{}/{}", config.display_base_url(), slug));
+                tunnel::spawn_keepalive(tunnel_url);
                 tunnel_child = Some(child);
             }
             Err(e) => {
@@ -100,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     let _raw_guard = local::RawModeGuard::enter()?;
 
     tokio::select! {
-        _ = local::run_local(session.clone(), bar_url, slug) => {}
+        _ = local::run_local(session.clone(), full_url, display_url, config) => {}
         _ = server::accept_loop(listener, session.clone()) => {}
         _ = session.wait_for_exit() => {}
     }

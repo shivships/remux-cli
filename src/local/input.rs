@@ -11,6 +11,7 @@ pub enum StdinEvent {
     SelectEnd,
     ModalToggle,
     ModalCopy,
+    ModalToggleStartup,
     ModalQuit,
     ModalDismiss,
 }
@@ -34,6 +35,7 @@ pub fn parse_stdin(bytes: &[u8], inner_wants_mouse: bool, modal_open: bool) -> V
         if modal_open {
             match bytes[i] {
                 b'c' | b'C' => { events.push(StdinEvent::ModalCopy); i += 1; continue; }
+                b'd' | b'D' => { events.push(StdinEvent::ModalToggleStartup); i += 1; continue; }
                 b'q' | b'Q' => { events.push(StdinEvent::ModalQuit); i += 1; continue; }
                 0x1b => {
                     // Bare Esc (not followed by [) dismisses modal

@@ -232,14 +232,14 @@ async fn flush_bar(
     stdout: &mut impl IoWrite,
     size: &AtomicSize,
     session: &SharedSession,
-    bar_url: Option<&str>,
-    slug: Option<&str>,
+    display_url: Option<&str>,
+    full_url: Option<&str>,
 ) -> std::io::Result<()> {
     let cols = size.cols.load(Ordering::Relaxed);
     let rows = size.rows.load(Ordering::Relaxed);
     let flash_copied = size.flash_copied.load(Ordering::Relaxed);
     let count = session.client_count().await;
-    draw_bar(stdout, cols, rows, bar_url, slug, count, flash_copied);
+    draw_bar(stdout, cols, rows, display_url, full_url, count, flash_copied);
     stdout.flush()
 }
 
@@ -248,17 +248,18 @@ async fn flush_term_with_bar(
     term: &mut Term<Proxy>,
     size: &AtomicSize,
     session: &SharedSession,
-    bar_url: Option<&str>,
-    slug: Option<&str>,
+    display_url: Option<&str>,
+    full_url: Option<&str>,
 ) -> std::io::Result<()> {
     flush_term(stdout, term)?;
-    flush_bar(stdout, size, session, bar_url, slug).await
+    flush_bar(stdout, size, session, display_url, full_url).await
 }
 
 pub async fn run_local(
     session: Arc<SharedSession>,
-    bar_url: Option<String>,
-    slug: Option<String>,
+    full_url: Option<String>,
+    display_url: Option<String>,
+    mut config: crate::config::Config,
 ) -> anyhow::Result<()> {
     let (cols, rows) = crossterm::terminal::size()?;
     let pty_rows = rows.saturating_sub(1).max(1);
@@ -309,11 +310,32 @@ pub async fn run_local(
     position_cursor(&mut buf, &term);
     stdout.write_all(&buf)?;
 
-    flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+    flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
 
     // Modal state
     let modal_open = Arc::new(AtomicBool::new(false));
-    let modal_content = slug.as_deref().map(|s| Arc::new(ModalContent::new(s)));
+    let modal_content = match (&full_url, &display_url) {
+        (Some(full), Some(display)) => Some(Arc::new(ModalContent::new(full, display))),
+        _ => None,
+    };
+
+    // Auto-show QR modal on start
+    if config.show_qr_on_start {
+        if let Some(ref content) = modal_content {
+            modal_open.store(true, Ordering::SeqCst);
+            let cols = size.cols.load(Ordering::Relaxed);
+            let rows = size.rows.load(Ordering::Relaxed);
+            let _ = stdout.write_all(b"\x1b[?25l");
+            for frame in 0..3u8 {
+                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
+                stdout.write_all(&data)?;
+                stdout.flush()?;
+                if frame < 2 {
+                    tokio::time::sleep(Duration::from_millis(33)).await;
+                }
+            }
+        }
+    }
 
     // Stdin task
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<StdinEvent>();
@@ -424,7 +446,7 @@ pub async fn run_local(
                             term.reset_damage();
                             stdout.write_all(&buf)?;
 
-                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -443,7 +465,7 @@ pub async fn run_local(
                             term.scroll_display(Scroll::Bottom);
                         }
                         if needs_redraw {
-                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                         session.write_input(data).await;
                     }
@@ -459,7 +481,7 @@ pub async fn run_local(
                         } else {
                             term.scroll_display(Scroll::Delta(n));
                             debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                     }
                     StdinEvent::ScrollDown(n) => {
@@ -473,7 +495,7 @@ pub async fn run_local(
                         } else {
                             term.scroll_display(Scroll::Delta(-n));
                             debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                     }
                     StdinEvent::Mouse(data) => {
@@ -496,7 +518,7 @@ pub async fn run_local(
                                     modal_open.store(true, Ordering::SeqCst);
                                     let _ = stdout.write_all(b"\x1b[?25l");
                                     for frame in 0..3u8 {
-                                        let data = content.render_frame(cols, rows, frame);
+                                        let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
                                         stdout.write_all(&data)?;
                                         stdout.flush()?;
                                         if frame < 2 {
@@ -505,8 +527,7 @@ pub async fn run_local(
                                     }
                                 }
                                 continue;
-                            } else if let Some(ref s) = slug {
-                                let url = format!("https://remux.sh/{}", s);
+                            } else if let Some(ref url) = full_url {
                                 let encoded = base64_encode(url.as_bytes());
                                 let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
                                 stdout.flush()?;
@@ -549,7 +570,7 @@ pub async fn run_local(
                             }
                         }
 
-                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                     }
                     StdinEvent::SelectUpdate(col, row) => {
                         if term.selection.is_some() {
@@ -559,7 +580,7 @@ pub async fn run_local(
                                 sel.update(point, Side::Right);
                             }
 
-                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                     }
                     StdinEvent::SelectEnd => {
@@ -575,7 +596,7 @@ pub async fn run_local(
                         // Single click drag: clear selection
                         if click_count <= 1 {
                             term.selection = None;
-                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                         stdout.flush()?;
                     }
@@ -587,14 +608,14 @@ pub async fn run_local(
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
                             flush_term(&mut stdout, &mut term)?;
                             let _ = stdout.write_all(b"\x1b[?25h");
-                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         } else if let Some(ref content) = modal_content {
                             modal_open.store(true, Ordering::SeqCst);
                             let cols = size.cols.load(Ordering::Relaxed);
                             let rows = size.rows.load(Ordering::Relaxed);
                             let _ = stdout.write_all(b"\x1b[?25l");
                             for frame in 0..3u8 {
-                                let data = content.render_frame(cols, rows, frame);
+                                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
                                 stdout.write_all(&data)?;
                                 stdout.flush()?;
                                 if frame < 2 {
@@ -611,6 +632,22 @@ pub async fn run_local(
                             let _ = copy_notify_tx.send(());
                         }
                     }
+                    StdinEvent::ModalToggleStartup => {
+                        config.show_qr_on_start = !config.show_qr_on_start;
+                        if let Err(e) = config.save() {
+                            debug_log(&format!("failed to save config: {}", e));
+                        }
+                        // Re-render modal in place to reflect new toggle state
+                        if modal_open.load(Ordering::SeqCst) {
+                            if let Some(ref content) = modal_content {
+                                let cols = size.cols.load(Ordering::Relaxed);
+                                let rows = size.rows.load(Ordering::Relaxed);
+                                let data = content.render_frame(cols, rows, 2, config.show_qr_on_start);
+                                stdout.write_all(&data)?;
+                                stdout.flush()?;
+                            }
+                        }
+                    }
                     StdinEvent::ModalQuit => {
                         break;
                     }
@@ -621,7 +658,7 @@ pub async fn run_local(
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
                             flush_term(&mut stdout, &mut term)?;
                             let _ = stdout.write_all(b"\x1b[?25h");
-                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                            flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         }
                     }
                 }
@@ -633,14 +670,14 @@ pub async fn run_local(
                 let pty_rows = rows.saturating_sub(1).max(1);
                 term.resize(TermSize::new(pty_rows, cols));
                 let _ = write!(stdout, "\x1b[1;{}r", pty_rows);
-                flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                flush_term_with_bar(&mut stdout, &mut term, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
             }
             Some(_) = copy_notify_rx.recv() => {
                 let was_active = copy_flash_until.is_some();
                 copy_flash_until = Some(tokio::time::Instant::now() + COPY_FLASH_DURATION);
                 if !was_active {
                     size.flash_copied.store(true, Ordering::Relaxed);
-                    flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                    flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                 }
             }
             _ = async {
@@ -651,7 +688,7 @@ pub async fn run_local(
             } => {
                 copy_flash_until = None;
                 size.flash_copied.store(false, Ordering::Relaxed);
-                flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
             }
             _ = &mut stdin_task => break,
         }
