@@ -449,15 +449,32 @@ pub async fn run_local(
                     }
                     StdinEvent::ScrollUp(n) => {
                         debug_log(&format!("SCROLL UP {} (offset before: {})", n, term.grid().display_offset()));
-                        term.scroll_display(Scroll::Delta(n));
-                        debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                        let mode = *term.mode();
+                        if mode.contains(TermMode::ALT_SCREEN) && !mode.intersects(TermMode::MOUSE_MODE) {
+                            // Alternate screen without mouse mode: convert scroll to arrow keys
+                            let arrow = if mode.contains(TermMode::APP_CURSOR) { b"\x1bOA".as_slice() } else { b"\x1b[A".as_slice() };
+                            let mut keys = Vec::with_capacity(arrow.len() * n as usize);
+                            for _ in 0..n { keys.extend_from_slice(arrow); }
+                            session.write_input(keys).await;
+                        } else {
+                            term.scroll_display(Scroll::Delta(n));
+                            debug_log(&format!("  offset after: {}", term.grid().display_offset()));
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                        }
                     }
                     StdinEvent::ScrollDown(n) => {
                         debug_log(&format!("SCROLL DOWN {} (offset before: {})", n, term.grid().display_offset()));
-                        term.scroll_display(Scroll::Delta(-n));
-                        debug_log(&format!("  offset after: {}", term.grid().display_offset()));
-                        flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                        let mode = *term.mode();
+                        if mode.contains(TermMode::ALT_SCREEN) && !mode.intersects(TermMode::MOUSE_MODE) {
+                            let arrow = if mode.contains(TermMode::APP_CURSOR) { b"\x1bOB".as_slice() } else { b"\x1b[B".as_slice() };
+                            let mut keys = Vec::with_capacity(arrow.len() * n as usize);
+                            for _ in 0..n { keys.extend_from_slice(arrow); }
+                            session.write_input(keys).await;
+                        } else {
+                            term.scroll_display(Scroll::Delta(-n));
+                            debug_log(&format!("  offset after: {}", term.grid().display_offset()));
+                            flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                        }
                     }
                     StdinEvent::Mouse(data) => {
                         session.write_input(data).await;
