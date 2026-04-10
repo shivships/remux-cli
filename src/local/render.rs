@@ -5,7 +5,7 @@ use std::io::Write as IoWrite;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::TermDamage;
+use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use alacritty_terminal::Term;
 
@@ -147,7 +147,16 @@ pub fn render_damage(buf: &mut Vec<u8>, term: &mut Term<Proxy>) {
 pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
     use std::io::Write;
     let cursor = term.grid().cursor.point;
-    let _ = write!(buf, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
+    let offset = term.grid().display_offset() as i32;
+    let screen_line = cursor.line.0 + offset;
+    if screen_line >= 0 && (screen_line as usize) < term.screen_lines() {
+        if term.mode().contains(TermMode::SHOW_CURSOR) {
+            let _ = write!(buf, "\x1b[?25h");
+        }
+        let _ = write!(buf, "\x1b[{};{}H", screen_line + 1, cursor.column.0 + 1);
+    } else {
+        let _ = write!(buf, "\x1b[?25l");
+    }
 }
 
 pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Option<&str>, full_url: Option<&str>, clients: usize, flash_copied: bool, flash_url_copied: bool) {
