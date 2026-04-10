@@ -6,6 +6,7 @@ const BOLD_PRIMARY: &str = "\x1b[1;38;2;250;250;250m"; // #FAFAFA bold — URL +
 const SECONDARY: &str = "\x1b[38;2;163;163;163m";      // #A3A3A3 — title
 const MUTED: &str = "\x1b[38;2;154;154;154m";          // #9A9A9A — hint verbs
 const LIVE: &str = "\x1b[38;2;34;197;94m";             // #22C55E — toggle on
+const BOLD_LIVE: &str = "\x1b[1;38;2;34;197;94m";      // #22C55E bold — "Copied!" flash
 const RESET: &str = "\x1b[0m";
 
 pub struct ModalContent {
@@ -28,9 +29,9 @@ impl ModalContent {
         Self { url, display_url, qr_lines }
     }
 
-    pub fn render_frame(&self, cols: u16, rows: u16, frame: u8, show_on_start: bool) -> Vec<u8> {
+    pub fn render_frame(&self, cols: u16, rows: u16, frame: u8, show_on_start: bool, copied: bool) -> Vec<u8> {
         let pty_rows = rows.saturating_sub(1).max(1) as usize;
-        let all_lines = self.build_content_lines(cols, show_on_start);
+        let all_lines = self.build_content_lines(cols, show_on_start, copied);
         let box_height = all_lines.len();
         let box_width = all_lines.iter().map(|l| visible_len(l)).max().unwrap_or(0);
 
@@ -70,7 +71,7 @@ impl ModalContent {
         out.into_bytes()
     }
 
-    fn build_content_lines(&self, cols: u16, show_on_start: bool) -> Vec<String> {
+    fn build_content_lines(&self, cols: u16, show_on_start: bool, copied: bool) -> Vec<String> {
         let cols = cols as usize;
 
         let qr_width = self.qr_lines.first().map(|l| l.chars().count()).unwrap_or(0);
@@ -86,7 +87,7 @@ impl ModalContent {
         let w = content_width + 6;
 
         if w > cols {
-            return self.build_compact_lines(cols, show_on_start);
+            return self.build_compact_lines(cols, show_on_start, copied);
         }
 
         let mut lines: Vec<String> = Vec::new();
@@ -114,7 +115,11 @@ impl ModalContent {
             lines.push(blank());
         }
 
-        {
+        if copied {
+            let copied_text = "Copied!";
+            let styled = format!("{BOLD_LIVE}{copied_text}");
+            lines.push(centered_fixed(&styled, copied_text.len()));
+        } else {
             let url = &self.url;
             let display_url = &self.display_url;
             let url_styled = format!(
@@ -141,7 +146,7 @@ impl ModalContent {
         lines
     }
 
-    fn build_compact_lines(&self, cols: usize, show_on_start: bool) -> Vec<String> {
+    fn build_compact_lines(&self, cols: usize, show_on_start: bool, copied: bool) -> Vec<String> {
         let w = cols.saturating_sub(4);
         if w < 10 {
             return Vec::new();
@@ -149,17 +154,26 @@ impl ModalContent {
 
         let mut lines: Vec<String> = Vec::new();
 
-        let display = if self.display_url.len() > w {
-            &self.display_url[..w]
+        if copied {
+            let copied_text = "Copied!";
+            let pad = w.saturating_sub(copied_text.len());
+            lines.push(format!(
+                "{MODAL_BG}{BOLD_LIVE}{copied_text}{RESET}{MODAL_BG}{}",
+                " ".repeat(pad),
+            ));
         } else {
-            &self.display_url
-        };
-        let pad = w.saturating_sub(display.len());
-        let url = &self.url;
-        lines.push(format!(
-            "{MODAL_BG}{BOLD_PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07{RESET}{MODAL_BG}{}",
-            " ".repeat(pad),
-        ));
+            let display = if self.display_url.len() > w {
+                &self.display_url[..w]
+            } else {
+                &self.display_url
+            };
+            let pad = w.saturating_sub(display.len());
+            let url = &self.url;
+            lines.push(format!(
+                "{MODAL_BG}{BOLD_PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07{RESET}{MODAL_BG}{}",
+                " ".repeat(pad),
+            ));
+        }
 
         let (mark, mark_color) = if show_on_start { ("\u{2713}", LIVE) } else { ("\u{2717}", MUTED) };
         let hints = format!("[c] copy [q] quit [d] startup {mark} [esc]");

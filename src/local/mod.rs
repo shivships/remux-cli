@@ -330,7 +330,7 @@ pub async fn run_local(
             let rows = size.rows.load(Ordering::Relaxed);
             let _ = stdout.write_all(b"\x1b[?25l");
             for frame in 0..3u8 {
-                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
+                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start, false);
                 stdout.write_all(&data)?;
                 stdout.flush()?;
                 if frame < 2 {
@@ -396,6 +396,7 @@ pub async fn run_local(
     // "Copied!" flash deadline — Some(when_to_expire) while visible.
     let mut copy_flash_until: Option<tokio::time::Instant> = None;
     let mut url_flash_until: Option<tokio::time::Instant> = None;
+    let mut modal_copied_until: Option<tokio::time::Instant> = None;
     const COPY_FLASH_DURATION: Duration = Duration::from_millis(900);
 
     // Output loop
@@ -520,9 +521,10 @@ pub async fn run_local(
                             if col as usize >= right_start {
                                 if let Some(ref content) = modal_content {
                                     modal_open.store(true, Ordering::SeqCst);
+                                    modal_copied_until = None;
                                     let _ = stdout.write_all(b"\x1b[?25l");
                                     for frame in 0..3u8 {
-                                        let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
+                                        let data = content.render_frame(cols, rows, frame, config.show_qr_on_start, false);
                                         stdout.write_all(&data)?;
                                         stdout.flush()?;
                                         if frame < 2 {
@@ -610,6 +612,7 @@ pub async fn run_local(
                         let is_open = modal_open.load(Ordering::SeqCst);
                         if is_open {
                             modal_open.store(false, Ordering::SeqCst);
+                            modal_copied_until = None;
                             let pty_rows = size.rows.load(Ordering::Relaxed).saturating_sub(1).max(1);
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
                             flush_term(&mut stdout, &mut term)?;
@@ -617,11 +620,12 @@ pub async fn run_local(
                             flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                         } else if let Some(ref content) = modal_content {
                             modal_open.store(true, Ordering::SeqCst);
+                            modal_copied_until = None;
                             let cols = size.cols.load(Ordering::Relaxed);
                             let rows = size.rows.load(Ordering::Relaxed);
                             let _ = stdout.write_all(b"\x1b[?25l");
                             for frame in 0..3u8 {
-                                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start);
+                                let data = content.render_frame(cols, rows, frame, config.show_qr_on_start, false);
                                 stdout.write_all(&data)?;
                                 stdout.flush()?;
                                 if frame < 2 {
@@ -634,8 +638,12 @@ pub async fn run_local(
                         if let Some(ref content) = modal_content {
                             let encoded = base64_encode(content.url.as_bytes());
                             let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+                            modal_copied_until = Some(tokio::time::Instant::now() + COPY_FLASH_DURATION);
+                            let cols = size.cols.load(Ordering::Relaxed);
+                            let rows = size.rows.load(Ordering::Relaxed);
+                            let data = content.render_frame(cols, rows, 2, config.show_qr_on_start, true);
+                            stdout.write_all(&data)?;
                             stdout.flush()?;
-                            let _ = copy_notify_tx.send(());
                         }
                     }
                     StdinEvent::ModalToggleStartup => {
@@ -648,7 +656,7 @@ pub async fn run_local(
                             if let Some(ref content) = modal_content {
                                 let cols = size.cols.load(Ordering::Relaxed);
                                 let rows = size.rows.load(Ordering::Relaxed);
-                                let data = content.render_frame(cols, rows, 2, config.show_qr_on_start);
+                                let data = content.render_frame(cols, rows, 2, config.show_qr_on_start, modal_copied_until.is_some());
                                 stdout.write_all(&data)?;
                                 stdout.flush()?;
                             }
@@ -660,6 +668,7 @@ pub async fn run_local(
                     StdinEvent::ModalDismiss => {
                         if modal_open.load(Ordering::SeqCst) {
                             modal_open.store(false, Ordering::SeqCst);
+                            modal_copied_until = None;
                             let pty_rows = size.rows.load(Ordering::Relaxed).saturating_sub(1).max(1);
                             let _ = write!(stdout, "\x1b[1;{}r\x1b[H\x1b[2J", pty_rows);
                             flush_term(&mut stdout, &mut term)?;
@@ -705,6 +714,23 @@ pub async fn run_local(
                 url_flash_until = None;
                 size.flash_url_copied.store(false, Ordering::Relaxed);
                 flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
+            }
+            _ = async {
+                match modal_copied_until {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                modal_copied_until = None;
+                if modal_open.load(Ordering::SeqCst) {
+                    if let Some(ref content) = modal_content {
+                        let cols = size.cols.load(Ordering::Relaxed);
+                        let rows = size.rows.load(Ordering::Relaxed);
+                        let data = content.render_frame(cols, rows, 2, config.show_qr_on_start, false);
+                        stdout.write_all(&data)?;
+                        stdout.flush()?;
+                    }
+                }
             }
             _ = &mut stdin_task => break,
         }
