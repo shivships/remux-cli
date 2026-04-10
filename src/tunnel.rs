@@ -147,13 +147,13 @@ impl TunnelManager {
 }
 
 fn extract_slug(tunnel_url: &str) -> String {
-    tunnel_url
+    let raw = tunnel_url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .split('.')
         .next()
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+    format!("cw-{}", raw)
 }
 
 pub async fn spawn_tunnel(

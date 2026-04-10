@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../remux-cli-${{ matrix.target }}.tar.gz remux-cli
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: remux-cli-${{ matrix.target }}
+          path: remux-cli-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect binaries
+        run: |
+          mkdir -p release
+          mv artifacts/remux-cli-*/*.tar.gz release/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ needs.version.outputs.version }}"
+
+          # Delete existing release + tag if present (allows overwrite)
+          gh release delete "$tag" --yes 2>/dev/null || true
+          git push origin :"$tag" 2>/dev/null || true
+
+          gh release create "$tag" release/*.tar.gz \
+            --title "remux-cli $tag" \
+            --notes "Release $tag" \
+            --target main
