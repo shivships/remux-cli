@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Stdio;
 
 use regex::Regex;
@@ -11,21 +12,10 @@ const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEPALIVE_FAIL_THRESHOLD: u32 = 3;
 
-pub async fn spawn_tunnel(port: u16) -> anyhow::Result<(Child, String)> {
-    let which = Command::new("which")
-        .arg("cloudflared")
-        .output()
-        .await;
+pub async fn spawn_tunnel(cloudflared_bin: &Path, port: u16) -> anyhow::Result<(Child, String)> {
+    info!(port, path = %cloudflared_bin.display(), "Starting cloudflared tunnel");
 
-    if which.is_err() || !which.unwrap().status.success() {
-        anyhow::bail!(
-            "cloudflared not found on PATH. Install it: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
-        );
-    }
-
-    info!(port, "Starting cloudflared tunnel");
-
-    let mut child = Command::new("cloudflared")
+    let mut child = Command::new(cloudflared_bin)
         .args(["tunnel", "--url", &format!("http://127.0.0.1:{}", port)])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

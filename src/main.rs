@@ -3,6 +3,7 @@ use std::io::Write;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+mod cloudflared;
 mod config;
 mod local;
 mod modal;
@@ -38,6 +39,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
+    // Resolve cloudflared binary (may prompt user to download, exits on decline)
+    let cloudflared_bin = match cloudflared::ensure_cloudflared().await {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
     // Start tunnel with spinner animation (pre-alt-screen)
     let mut tunnel_child = None;
     let mut full_url: Option<String> = None;
@@ -51,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         write!(stdout, "  {} Creating tunnel...", SPINNER[0])?;
         stdout.flush()?;
 
-        let tunnel_fut = tunnel::spawn_tunnel(port);
+        let tunnel_fut = tunnel::spawn_tunnel(&cloudflared_bin, port);
         tokio::pin!(tunnel_fut);
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
 
