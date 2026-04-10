@@ -43,9 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let cloudflared_bin = cloudflared::ensure_cloudflared().await?;
 
     // Start tunnel with spinner animation (pre-alt-screen)
-    let mut tunnel_child;
-    let full_url: String;
-    let display_url: String;
+    let tunnel_state_rx;
 
     {
         const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -74,18 +72,17 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        let (child, tunnel_url) = result?;
-        let slug = tunnel_url
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .split('.')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        full_url = format!("{}/{}", config.base_url, slug);
-        display_url = format!("{}/{}", config.display_base_url(), slug);
-        tunnel::spawn_keepalive(tunnel_url);
-        tunnel_child = child;
+        let (child, tunnel_url, stderr_handle) = result?;
+
+        tunnel_state_rx = tunnel::TunnelManager::start(
+            child,
+            tunnel_url,
+            stderr_handle,
+            cloudflared_bin.clone(),
+            port,
+            config.base_url.clone(),
+            config.display_base_url().to_string(),
+        );
     }
 
     // Restore terminal on panic
@@ -100,15 +97,12 @@ async fn main() -> anyhow::Result<()> {
     let _raw_guard = local::RawModeGuard::enter()?;
 
     tokio::select! {
-        _ = local::run_local(session.clone(), Some(full_url), Some(display_url), config) => {}
+        _ = local::run_local(session.clone(), tunnel_state_rx, config) => {}
         _ = server::accept_loop(listener, session.clone()) => {}
         _ = session.wait_for_exit() => {}
     }
 
     drop(_raw_guard);
-    // Kill the tunnel subprocess before exiting. start_kill() is synchronous
-    // and sends SIGKILL immediately; no need to await.
-    tunnel_child.start_kill().ok();
     // Background tokio tasks (SIGWINCH handler, keepalive, etc.) have no
     // cancellation mechanism and would prevent clean runtime shutdown.
     std::process::exit(0);

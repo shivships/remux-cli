@@ -9,6 +9,8 @@ use alacritty_terminal::term::{TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use alacritty_terminal::Term;
 
+use crate::tunnel::TunnelState;
+
 use super::Proxy;
 
 pub fn write_color(buf: &mut Vec<u8>, color: Color, is_fg: bool) {
@@ -159,7 +161,7 @@ pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
     }
 }
 
-pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Option<&str>, full_url: Option<&str>, clients: usize, flash_copied: bool, flash_url_copied: bool) {
+pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, tunnel_state: &TunnelState, clients: usize, flash_copied: bool, flash_url_copied: bool) {
     let w = cols as usize;
 
     // Bar palette
@@ -174,28 +176,30 @@ pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Op
     let remote_str = remote.to_string();
     let dot_color = if remote >= 1 { LIVE } else { MUTED };
 
-    let (left_styled, left_visible) = if let (Some(display), Some(url)) = (display_url, full_url) {
-        let url_width = display.chars().count();
-        let url_segment = if flash_url_copied {
-            // Replace URL text with "Copied!" padded to same width
-            let copied = "Copied!";
-            let pad = url_width.saturating_sub(copied.len());
-            format!(" {BOLD_LIVE}{copied}{}\x1b[0m{BG}", " ".repeat(pad))
-        } else {
-            format!(" {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07")
-        };
-        let styled = format!(
-            "{url_segment} {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
-        );
-        // Visible: " " + url_width + " │ ● " + count + " connected"
-        let visible = 16 + url_width + remote_str.len();
-        (styled, visible)
-    } else {
-        let styled = format!(
-            " {dot_color}● {SECONDARY}{remote_str} connected"
-        );
-        let visible = 13 + remote_str.len();
-        (styled, visible)
+    let (left_styled, left_visible) = match tunnel_state {
+        TunnelState::Connected { full_url, display_url } => {
+            let url_width = display_url.chars().count();
+            let url_segment = if flash_url_copied {
+                let copied = "Copied!";
+                let pad = url_width.saturating_sub(copied.len());
+                format!(" {BOLD_LIVE}{copied}{}\x1b[0m{BG}", " ".repeat(pad))
+            } else {
+                format!(" {PRIMARY}\x1b]8;;{full_url}\x07{display_url}\x1b]8;;\x07")
+            };
+            let styled = format!(
+                "{url_segment} {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
+            );
+            let visible = 16 + url_width + remote_str.len();
+            (styled, visible)
+        }
+        TunnelState::Reconnecting => {
+            let text = "Reconnecting tunnel\u{2026}";
+            let styled = format!(
+                " {SECONDARY}{text} {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
+            );
+            let visible = 1 + text.chars().count() + 3 + 2 + remote_str.len() + 10;
+            (styled, visible)
+        }
     };
 
     // Right segment: "Ctrl+Q: share", optionally prefixed with "Copied! " during flash.
