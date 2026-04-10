@@ -39,19 +39,13 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
-    // Resolve cloudflared binary (may prompt user to download, exits on decline)
-    let cloudflared_bin = match cloudflared::ensure_cloudflared().await {
-        Ok(path) => path,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
+    // Resolve cloudflared binary (may prompt user to download)
+    let cloudflared_bin = cloudflared::ensure_cloudflared().await?;
 
     // Start tunnel with spinner animation (pre-alt-screen)
-    let mut tunnel_child = None;
-    let mut full_url: Option<String> = None;
-    let mut display_url: Option<String> = None;
+    let mut tunnel_child;
+    let full_url: String;
+    let display_url: String;
 
     {
         const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -68,7 +62,6 @@ async fn main() -> anyhow::Result<()> {
         let result = loop {
             tokio::select! {
                 result = &mut tunnel_fut => {
-                    // Clear spinner line before entering alt screen
                     write!(stdout, "\r\x1b[2K")?;
                     stdout.flush()?;
                     break result;
@@ -81,24 +74,18 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        match result {
-            Ok((child, tunnel_url)) => {
-                let slug = tunnel_url
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                full_url = Some(format!("{}/{}", config.base_url, slug));
-                display_url = Some(format!("{}/{}", config.display_base_url(), slug));
-                tunnel::spawn_keepalive(tunnel_url);
-                tunnel_child = Some(child);
-            }
-            Err(e) => {
-                eprintln!("tunnel unavailable: {}", e);
-            }
-        }
+        let (child, tunnel_url) = result?;
+        let slug = tunnel_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        full_url = format!("{}/{}", config.base_url, slug);
+        display_url = format!("{}/{}", config.display_base_url(), slug);
+        tunnel::spawn_keepalive(tunnel_url);
+        tunnel_child = child;
     }
 
     // Restore terminal on panic
@@ -113,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     let _raw_guard = local::RawModeGuard::enter()?;
 
     tokio::select! {
-        _ = local::run_local(session.clone(), full_url, display_url, config) => {}
+        _ = local::run_local(session.clone(), Some(full_url), Some(display_url), config) => {}
         _ = server::accept_loop(listener, session.clone()) => {}
         _ = session.wait_for_exit() => {}
     }
@@ -121,9 +108,7 @@ async fn main() -> anyhow::Result<()> {
     drop(_raw_guard);
     // Kill the tunnel subprocess before exiting. start_kill() is synchronous
     // and sends SIGKILL immediately; no need to await.
-    if let Some(ref mut child) = tunnel_child {
-        child.start_kill().ok();
-    }
+    tunnel_child.start_kill().ok();
     // Background tokio tasks (SIGWINCH handler, keepalive, etc.) have no
     // cancellation mechanism and would prevent clean runtime shutdown.
     std::process::exit(0);

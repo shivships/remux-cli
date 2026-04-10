@@ -20,21 +20,28 @@ pub async fn spawn_tunnel(cloudflared_bin: &Path, port: u16) -> anyhow::Result<(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()?;
+        .spawn()
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to run cloudflared: {}", e)
+        })?;
 
     let stderr = child
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("Failed to capture cloudflared stderr"))?;
 
-    let (url, reader) = timeout(TUNNEL_TIMEOUT, parse_tunnel_url(stderr))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Timed out waiting for cloudflared tunnel URL after {}s",
+    let result = timeout(TUNNEL_TIMEOUT, parse_tunnel_url(stderr)).await;
+
+    let (url, reader) = match result {
+        Ok(inner) => inner?,
+        Err(_) => {
+            child.kill().await.ok();
+            anyhow::bail!(
+                "Tunnel creation timed out — cloudflared did not return a URL within {}s",
                 TUNNEL_TIMEOUT.as_secs()
-            )
-        })??;
+            );
+        }
+    };
 
     tokio::spawn(async move {
         let mut lines = reader.lines();
