@@ -71,28 +71,8 @@ fn find_in_path() -> Option<PathBuf> {
 
 /// Where we install cloudflared when the user opts in to auto-download.
 fn managed_bin_path() -> PathBuf {
-    #[cfg(windows)]
-    {
-        let base = std::env::var("LOCALAPPDATA")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string());
-                format!("{}\\AppData\\Local", home)
-            });
-        PathBuf::from(base)
-            .join("remux")
-            .join("bin")
-            .join("cloudflared.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        let data_dir = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                PathBuf::from(home).join(".local").join("share")
-            });
-        data_dir.join("remux").join("bin").join("cloudflared")
-    }
+    let bin_name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+    crate::config::remux_home().join("bin").join(bin_name)
 }
 
 fn is_executable(path: &Path) -> bool {

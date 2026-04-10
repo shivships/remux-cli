@@ -52,12 +52,17 @@ impl Config {
     }
 }
 
-fn config_path() -> PathBuf {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
+/// Returns the base directory for all remux data: `~/.remux`.
+/// Override with `REMUX_HOME` env var.
+pub fn remux_home() -> PathBuf {
+    std::env::var("REMUX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            PathBuf::from(home).join(".config")
-        });
-    config_dir.join("remux").join("config.toml")
+            PathBuf::from(home).join(".remux")
+        })
+}
+
+fn config_path() -> PathBuf {
+    remux_home().join("config.toml")
 }

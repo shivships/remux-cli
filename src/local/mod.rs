@@ -177,7 +177,8 @@ fn debug_log(msg: &str) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     let enabled = ENABLED.get_or_init(|| std::env::var("REMUX_DEBUG").is_ok());
     if !enabled { return; }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("/tmp/remux-debug.log") {
+    let log_path = crate::config::remux_home().join("debug.log");
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = writeln!(f, "{}", msg);
     }
 }

@@ -12,9 +12,14 @@ mod server;
 mod session;
 mod shared_session;
 mod tunnel;
+mod uninstall;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("uninstall") {
+        return uninstall::run();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
