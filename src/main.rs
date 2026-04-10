@@ -35,27 +35,56 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
 
-    // Start tunnel, extract slug for status bar
+    // Start tunnel with spinner animation (pre-alt-screen)
     let mut tunnel_child = None;
     let mut bar_url: Option<String> = None;
     let mut slug: Option<String> = None;
 
-    match tunnel::spawn_tunnel(port).await {
-        Ok((child, url)) => {
-            let s = url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('.')
-                .next()
-                .unwrap_or("")
-                .to_string();
-            bar_url = Some(format!("remux.sh/{}", s));
-            slug = Some(s);
-            tunnel::spawn_keepalive(url);
-            tunnel_child = Some(child);
-        }
-        Err(e) => {
-            eprintln!("tunnel unavailable: {}", e);
+    {
+        const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let mut stdout = std::io::stdout();
+        let mut frame = 0usize;
+
+        write!(stdout, "  {} Creating tunnel...", SPINNER[0])?;
+        stdout.flush()?;
+
+        let tunnel_fut = tunnel::spawn_tunnel(port);
+        tokio::pin!(tunnel_fut);
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
+
+        let result = loop {
+            tokio::select! {
+                result = &mut tunnel_fut => {
+                    // Clear spinner line before entering alt screen
+                    write!(stdout, "\r\x1b[2K")?;
+                    stdout.flush()?;
+                    break result;
+                }
+                _ = interval.tick() => {
+                    frame = (frame + 1) % SPINNER.len();
+                    write!(stdout, "\r  {} Creating tunnel...", SPINNER[frame])?;
+                    stdout.flush()?;
+                }
+            }
+        };
+
+        match result {
+            Ok((child, url)) => {
+                let s = url
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                bar_url = Some(format!("remux.sh/{}", s));
+                slug = Some(s);
+                tunnel::spawn_keepalive(url);
+                tunnel_child = Some(child);
+            }
+            Err(e) => {
+                eprintln!("tunnel unavailable: {}", e);
+            }
         }
     }
 
