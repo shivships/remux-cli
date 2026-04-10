@@ -218,6 +218,7 @@ struct AtomicSize {
     cols: AtomicU16,
     rows: AtomicU16,
     flash_copied: AtomicBool,
+    flash_url_copied: AtomicBool,
 }
 
 fn flush_term(stdout: &mut impl IoWrite, term: &mut Term<Proxy>) -> std::io::Result<()> {
@@ -238,8 +239,9 @@ async fn flush_bar(
     let cols = size.cols.load(Ordering::Relaxed);
     let rows = size.rows.load(Ordering::Relaxed);
     let flash_copied = size.flash_copied.load(Ordering::Relaxed);
+    let flash_url_copied = size.flash_url_copied.load(Ordering::Relaxed);
     let count = session.client_count().await;
-    draw_bar(stdout, cols, rows, display_url, full_url, count, flash_copied);
+    draw_bar(stdout, cols, rows, display_url, full_url, count, flash_copied, flash_url_copied);
     stdout.flush()
 }
 
@@ -270,6 +272,7 @@ pub async fn run_local(
         cols: AtomicU16::new(cols),
         rows: AtomicU16::new(rows),
         flash_copied: AtomicBool::new(false),
+        flash_url_copied: AtomicBool::new(false),
     });
 
     let (pty_write_tx, mut pty_write_rx) = mpsc::unbounded_channel::<String>();
@@ -392,6 +395,7 @@ pub async fn run_local(
 
     // "Copied!" flash deadline — Some(when_to_expire) while visible.
     let mut copy_flash_until: Option<tokio::time::Instant> = None;
+    let mut url_flash_until: Option<tokio::time::Instant> = None;
     const COPY_FLASH_DURATION: Duration = Duration::from_millis(900);
 
     // Output loop
@@ -531,7 +535,9 @@ pub async fn run_local(
                                 let encoded = base64_encode(url.as_bytes());
                                 let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
                                 stdout.flush()?;
-                                let _ = copy_notify_tx.send(());
+                                url_flash_until = Some(tokio::time::Instant::now() + COPY_FLASH_DURATION);
+                                size.flash_url_copied.store(true, Ordering::Relaxed);
+                                flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
                             }
                             continue;
                         }
@@ -688,6 +694,16 @@ pub async fn run_local(
             } => {
                 copy_flash_until = None;
                 size.flash_copied.store(false, Ordering::Relaxed);
+                flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
+            }
+            _ = async {
+                match url_flash_until {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                url_flash_until = None;
+                size.flash_url_copied.store(false, Ordering::Relaxed);
                 flush_bar(&mut stdout, &size, &session, display_url.as_deref(), full_url.as_deref()).await?;
             }
             _ = &mut stdin_task => break,

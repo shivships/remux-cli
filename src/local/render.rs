@@ -150,7 +150,7 @@ pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
     let _ = write!(buf, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
 }
 
-pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Option<&str>, full_url: Option<&str>, clients: usize, flash_copied: bool) {
+pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Option<&str>, full_url: Option<&str>, clients: usize, flash_copied: bool, flash_url_copied: bool) {
     let w = cols as usize;
 
     // Bar palette
@@ -166,11 +166,20 @@ pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Op
     let dot_color = if remote >= 1 { LIVE } else { MUTED };
 
     let (left_styled, left_visible) = if let (Some(display), Some(url)) = (display_url, full_url) {
+        let url_width = display.chars().count();
+        let url_segment = if flash_url_copied {
+            // Replace URL text with "Copied!" padded to same width
+            let copied = "Copied!";
+            let pad = url_width.saturating_sub(copied.len());
+            format!(" {BOLD_LIVE}{copied}{}\x1b[0m{BG}", " ".repeat(pad))
+        } else {
+            format!(" {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07")
+        };
         let styled = format!(
-            " {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
+            "{url_segment} {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
         );
-        // Visible: " " + display + " │ ● " + count + " connected"
-        let visible = 16 + display.chars().count() + remote_str.len();
+        // Visible: " " + url_width + " │ ● " + count + " connected"
+        let visible = 16 + url_width + remote_str.len();
         (styled, visible)
     } else {
         let styled = format!(
