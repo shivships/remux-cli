@@ -161,21 +161,22 @@ pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, display_url: Op
     const LIVE: &str = "\x1b[38;2;34;197;94m";          // #22C55E
     const BOLD_LIVE: &str = "\x1b[1;38;2;34;197;94m";   // #22C55E bold — "Copied!" flash
 
-    let clients_str = clients.to_string();
-    let dot_color = if clients >= 1 { LIVE } else { MUTED };
+    let remote = clients.saturating_sub(1);
+    let remote_str = remote.to_string();
+    let dot_color = if remote >= 1 { LIVE } else { MUTED };
 
     let (left_styled, left_visible) = if let (Some(display), Some(url)) = (display_url, full_url) {
         let styled = format!(
-            " {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{clients_str} connected"
+            " {PRIMARY}\x1b]8;;{url}\x07{display}\x1b]8;;\x07 {MUTED}│ {dot_color}● {SECONDARY}{remote_str} connected"
         );
         // Visible: " " + display + " │ ● " + count + " connected"
-        let visible = 16 + display.chars().count() + clients_str.len();
+        let visible = 16 + display.chars().count() + remote_str.len();
         (styled, visible)
     } else {
         let styled = format!(
-            " {dot_color}● {SECONDARY}{clients_str} connected"
+            " {dot_color}● {SECONDARY}{remote_str} connected"
         );
-        let visible = 13 + clients_str.len();
+        let visible = 13 + remote_str.len();
         (styled, visible)
     };
 
