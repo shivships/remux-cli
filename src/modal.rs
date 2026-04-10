@@ -69,45 +69,6 @@ impl ModalContent {
         out.into_bytes()
     }
 
-    pub fn render_full(&self, cols: u16, rows: u16) -> Vec<u8> {
-        self.render_frame(cols, rows, 2)
-    }
-
-    pub fn render_copied_flash(&self, cols: u16, rows: u16) -> Vec<u8> {
-        let pty_rows = rows.saturating_sub(1).max(1) as usize;
-        let all_lines = self.build_content_lines(cols);
-        let box_height = all_lines.len();
-        let box_width = all_lines.iter().map(|l| visible_len(l)).max().unwrap_or(0);
-
-        if box_height < 2 {
-            return Vec::new();
-        }
-
-        let keybind_idx = box_height - 2;
-        let start_row = ((pty_rows.saturating_sub(box_height)) / 2).max(1);
-        let start_col = ((cols as usize).saturating_sub(box_width)) / 2 + 1;
-
-        let row = start_row + keybind_idx;
-        if row >= pty_rows {
-            return Vec::new();
-        }
-
-        let copied_text = "Copied!";
-        let pad_left = (box_width.saturating_sub(copied_text.len())) / 2;
-        let pad_right = box_width.saturating_sub(pad_left + copied_text.len());
-
-        let mut out = String::new();
-        let _ = write!(
-            out,
-            "\x1b7\x1b[{};{}H{}{}{}{}{}{}{}\x1b8",
-            row, start_col,
-            MODAL_BG, " ".repeat(pad_left),
-            BOLD_PRIMARY, copied_text, RESET,
-            MODAL_BG, " ".repeat(pad_right),
-        );
-        out.into_bytes()
-    }
-
     fn build_content_lines(&self, cols: u16) -> Vec<String> {
         let cols = cols as usize;
 

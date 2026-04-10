@@ -28,6 +28,7 @@ use render::{base64_encode, draw_bar, position_cursor, render_damage, render_ful
 pub(crate) struct Proxy {
     pty_tx: mpsc::UnboundedSender<String>,
     pending_stdout: Arc<std::sync::Mutex<Vec<String>>>,
+    copy_notify_tx: mpsc::UnboundedSender<()>,
 }
 
 impl EventListener for Proxy {
@@ -47,6 +48,7 @@ impl EventListener for Proxy {
                 };
                 let encoded = render::base64_encode(data.as_bytes());
                 self.pending_stdout.lock().unwrap().push(format!("\x1b]52;{};{}\x07", param, encoded));
+                let _ = self.copy_notify_tx.send(());
             }
             _ => {}
         }
@@ -215,6 +217,7 @@ fn format_bytes(bytes: &[u8]) -> String {
 struct AtomicSize {
     cols: AtomicU16,
     rows: AtomicU16,
+    flash_copied: AtomicBool,
 }
 
 fn flush_term(stdout: &mut impl IoWrite, term: &mut Term<Proxy>) -> std::io::Result<()> {
@@ -234,8 +237,9 @@ async fn flush_bar(
 ) -> std::io::Result<()> {
     let cols = size.cols.load(Ordering::Relaxed);
     let rows = size.rows.load(Ordering::Relaxed);
+    let flash_copied = size.flash_copied.load(Ordering::Relaxed);
     let count = session.client_count().await;
-    draw_bar(stdout, cols, rows, bar_url, slug, count);
+    draw_bar(stdout, cols, rows, bar_url, slug, count, flash_copied);
     stdout.flush()
 }
 
@@ -264,11 +268,17 @@ pub async fn run_local(
     let size = Arc::new(AtomicSize {
         cols: AtomicU16::new(cols),
         rows: AtomicU16::new(rows),
+        flash_copied: AtomicBool::new(false),
     });
 
     let (pty_write_tx, mut pty_write_rx) = mpsc::unbounded_channel::<String>();
+    let (copy_notify_tx, mut copy_notify_rx) = mpsc::unbounded_channel::<()>();
     let pending_stdout = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let proxy = Proxy { pty_tx: pty_write_tx, pending_stdout: Arc::clone(&pending_stdout) };
+    let proxy = Proxy {
+        pty_tx: pty_write_tx,
+        pending_stdout: Arc::clone(&pending_stdout),
+        copy_notify_tx: copy_notify_tx.clone(),
+    };
 
     let mut term = Term::new(
         Config::default(),
@@ -299,9 +309,7 @@ pub async fn run_local(
     position_cursor(&mut buf, &term);
     stdout.write_all(&buf)?;
 
-    let count = session.client_count().await;
-    draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-    stdout.flush()?;
+    flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
 
     // Modal state
     let modal_open = Arc::new(AtomicBool::new(false));
@@ -360,6 +368,10 @@ pub async fn run_local(
     let mut click_count: u8 = 0;
     const DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(300);
 
+    // "Copied!" flash deadline — Some(when_to_expire) while visible.
+    let mut copy_flash_until: Option<tokio::time::Instant> = None;
+    const COPY_FLASH_DURATION: Duration = Duration::from_millis(900);
+
     // Output loop
     let mut broadcast_rx = broadcast_rx;
     loop {
@@ -412,11 +424,7 @@ pub async fn run_local(
                             term.reset_damage();
                             stdout.write_all(&buf)?;
 
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let count = session.client_count().await;
-                            draw_bar(&mut stdout, cols, rows, bar_url.as_deref(), slug.as_deref(), count);
-                            stdout.flush()?;
+                            flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -484,18 +492,8 @@ pub async fn run_local(
                                 let url = format!("https://remux.sh/{}", s);
                                 let encoded = base64_encode(url.as_bytes());
                                 let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
-
-                                let display = bar_url.as_deref().unwrap_or("");
-                                let copied = "Copied!";
-                                let pad = display.len().saturating_sub(copied.len());
-                                let _ = write!(
-                                    stdout,
-                                    "\x1b7\x1b[{};2H\x1b[48;2;38;38;38m\x1b[1;38;2;250;250;250m{}{}\x1b[0m\x1b8",
-                                    rows, copied, " ".repeat(pad)
-                                );
                                 stdout.flush()?;
-                                tokio::time::sleep(Duration::from_millis(800)).await;
-                                flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                                let _ = copy_notify_tx.send(());
                             }
                             continue;
                         }
@@ -553,6 +551,7 @@ pub async fn run_local(
                             if !text.is_empty() {
                                 let encoded = base64_encode(text.as_bytes());
                                 let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
+                                let _ = copy_notify_tx.send(());
                             }
                         }
                         // Double/triple click: keep selection visible
@@ -591,15 +590,8 @@ pub async fn run_local(
                         if let Some(ref content) = modal_content {
                             let encoded = base64_encode(content.url.as_bytes());
                             let _ = write!(stdout, "\x1b]52;c;{}\x07", encoded);
-                            let cols = size.cols.load(Ordering::Relaxed);
-                            let rows = size.rows.load(Ordering::Relaxed);
-                            let flash = content.render_copied_flash(cols, rows);
-                            stdout.write_all(&flash)?;
                             stdout.flush()?;
-                            tokio::time::sleep(Duration::from_secs(1)).await;
-                            let frame = content.render_full(cols, rows);
-                            stdout.write_all(&frame)?;
-                            stdout.flush()?;
+                            let _ = copy_notify_tx.send(());
                         }
                     }
                     StdinEvent::ModalQuit => {
@@ -625,6 +617,24 @@ pub async fn run_local(
                 term.resize(TermSize::new(pty_rows, cols));
                 let _ = write!(stdout, "\x1b[1;{}r", pty_rows);
                 flush_term_with_bar(&mut stdout, &mut term, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+            }
+            Some(_) = copy_notify_rx.recv() => {
+                let was_active = copy_flash_until.is_some();
+                copy_flash_until = Some(tokio::time::Instant::now() + COPY_FLASH_DURATION);
+                if !was_active {
+                    size.flash_copied.store(true, Ordering::Relaxed);
+                    flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
+                }
+            }
+            _ = async {
+                match copy_flash_until {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                copy_flash_until = None;
+                size.flash_copied.store(false, Ordering::Relaxed);
+                flush_bar(&mut stdout, &size, &session, bar_url.as_deref(), slug.as_deref()).await?;
             }
             _ = &mut stdin_task => break,
         }

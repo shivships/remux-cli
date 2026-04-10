@@ -150,15 +150,16 @@ pub fn position_cursor(buf: &mut Vec<u8>, term: &Term<Proxy>) {
     let _ = write!(buf, "\x1b[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1);
 }
 
-pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&str>, slug: Option<&str>, clients: usize) {
+pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option<&str>, slug: Option<&str>, clients: usize, flash_copied: bool) {
     let w = cols as usize;
 
     // Bar palette
-    const BG: &str = "\x1b[48;2;38;38;38m";           // #262626
-    const PRIMARY: &str = "\x1b[38;2;250;250;250m";   // #FAFAFA
-    const SECONDARY: &str = "\x1b[38;2;163;163;163m"; // #A3A3A3
-    const MUTED: &str = "\x1b[38;2;82;82;82m";        // #525252
-    const LIVE: &str = "\x1b[38;2;34;197;94m";        // #22C55E
+    const BG: &str = "\x1b[48;2;38;38;38m";             // #262626
+    const PRIMARY: &str = "\x1b[38;2;250;250;250m";     // #FAFAFA
+    const SECONDARY: &str = "\x1b[38;2;163;163;163m";   // #A3A3A3
+    const MUTED: &str = "\x1b[38;2;82;82;82m";          // #525252
+    const LIVE: &str = "\x1b[38;2;34;197;94m";          // #22C55E
+    const BOLD_LIVE: &str = "\x1b[1;38;2;34;197;94m";   // #22C55E bold — "Copied!" flash
 
     let clients_str = clients.to_string();
     let dot_color = if clients >= 1 { LIVE } else { MUTED };
@@ -179,8 +180,19 @@ pub fn draw_bar(stdout: &mut impl IoWrite, cols: u16, rows: u16, bar_url: Option
         (styled, visible)
     };
 
-    let right_text_visible = "Ctrl+Q: share ".len();
-    let right_styled = format!("{PRIMARY}Ctrl+Q{MUTED}: {SECONDARY}share ");
+    // Right segment: "Ctrl+Q: share", optionally prefixed with "Copied! " during flash.
+    // \x1b[22m cancels bold after the flash text so "Ctrl+Q: share" stays non-bold.
+    let (right_styled, right_text_visible) = if flash_copied {
+        (
+            format!("{BOLD_LIVE}Copied! \x1b[22m{PRIMARY}Ctrl+Q{MUTED}: {SECONDARY}share "),
+            22, // "Copied! " (8) + "Ctrl+Q: share " (14)
+        )
+    } else {
+        (
+            format!("{PRIMARY}Ctrl+Q{MUTED}: {SECONDARY}share "),
+            14,
+        )
+    };
 
     let gap = w.saturating_sub(left_visible + right_text_visible);
 
