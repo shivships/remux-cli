@@ -13,12 +13,15 @@ mod session;
 mod shared_session;
 mod tunnel;
 mod uninstall;
+mod update;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("uninstall") {
         return uninstall::run();
     }
+
+    update::apply_staged_update();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -98,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = std::io::stdout().flush();
         default_hook(info);
     }));
+
+    // Background update check — fire and forget
+    tokio::spawn(update::background_update_check());
 
     let _raw_guard = local::RawModeGuard::enter()?;
 
